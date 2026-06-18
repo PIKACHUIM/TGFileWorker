@@ -7,5 +7,9 @@ export default defineConfig({
     proxy: {
       '/api': 'http://localhost:8789'
     }
+  },
+  build: {
+    outDir: '../works/dist-client',
+    emptyOutDir: true
   }
 })

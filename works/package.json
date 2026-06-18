@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
-    "dev:test": "wrangler dev -c wrangler.test.toml",
-    "deploy": "wrangler deploy",
-    "deploy:test": "wrangler deploy -c wrangler.test.toml",
+    "dev": "mkdir -p dist-client && wrangler dev",
+    "dev:test": "mkdir -p dist-client && wrangler dev -c wrangler.test.toml",
+    "build:frontend": "cd ../pages && pnpm install && pnpm run build",
+    "deploy": "pnpm run build:frontend && wrangler deploy",
+    "deploy:test": "pnpm run build:frontend && wrangler deploy -c wrangler.test.toml",
+    "deploy:worker-only": "wrangler deploy",
     "cf-typegen": "wrangler types"
   },
   "dependencies": {

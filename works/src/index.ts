@@ -38,7 +38,10 @@ app.route('/api/media', publicRoutes)
 app.route('/api/session-gen', sessionGenRoutes)
 app.route('/api', streamRoutes)
 
-app.get('/', (c) => c.text('tgfileui-work API'))
+// 非API请求转发给静态资源绑定（前端SPA）
+app.all('*', async (c) => {
+  return c.env.ASSETS.fetch(c.req.raw)
+})
 
 export { WebSocketProxy, SessionGenDO }
 export default app

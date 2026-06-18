@@ -1,44 +1,134 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, List } from 'antd'
-import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip } from 'antd'
+import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined } from '@ant-design/icons'
 import { getMediaDetail, getEpisodes, type MediaItem, type EpisodeItem } from '../api'
 import { formatSize } from '../utils'
 import { useTheme } from '../theme'
 import Artplayer from 'artplayer'
+import { useBufferedPlayer, type BufferState } from '../hooks/useBufferedPlayer'
 
 const { Title, Paragraph, Text } = Typography
 
+// ===== 缓冲状态指示器 =====
+function BufferIndicator({ bufferState, isDark, downloadProgress, fallback }: {
+  bufferState: BufferState | null
+  isDark: boolean
+  downloadProgress?: number
+  fallback?: boolean
+}) {
+  if (!bufferState) return null
+
+  const { isBuffering, bufferProgress, cachedSegments, totalSegments, prefetching, cachedBytes, totalBytes } = bufferState
+  const percent = Math.round(bufferProgress * 100)
+  const dlPercent = downloadProgress !== undefined ? Math.round(downloadProgress * 100) : null
+
+  return (
+    <div style={{
+      padding: '8px 12px',
+      background: isDark ? '#1f1f1f' : '#fafafa',
+      borderRadius: 6,
+      marginBottom: 8,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      fontSize: 12,
+      color: isDark ? '#999' : '#666',
+    }}>
+      <CloudOutlined style={{ fontSize: 16, color: isBuffering ? '#faad14' : '#52c41a' }} />
+      <div style={{ flex: 1 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+          <span>
+            {fallback ? '直接播放（大文件）' : isBuffering ? '缓冲中...' : '缓冲充足'}
+            {prefetching > 0 && ` (预加载 ${prefetching} 片段)`}
+            {dlPercent !== null && dlPercent < 100 && !fallback && ` · 下载 ${dlPercent}%`}
+          </span>
+          <span>{percent}%</span>
+        </div>
+        <Progress
+          percent={percent}
+          size="small"
+          strokeColor={isBuffering ? '#faad14' : '#52c41a'}
+          showInfo={false}
+          style={{ marginBottom: 0 }}
+        />
+      </div>
+      <Tooltip title={`已缓存 ${cachedSegments}/${totalSegments} 片段 (${formatSize(cachedBytes)}/${formatSize(totalBytes)})`}>
+        <Text style={{ fontSize: 12, color: isDark ? '#666' : '#999', cursor: 'help' }}>
+          {cachedSegments}/{totalSegments}
+        </Text>
+      </Tooltip>
+    </div>
+  )
+}
+
+// ===== 带缓存队列的视频播放器 =====
 function VideoPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const hlsRef = useRef<any>(null)
+  const { isDark } = useTheme()
+  const isHls = mimeType === 'application/x-mpegURL' || src.endsWith('.m3u8')
+
+  // 使用缓存播放器 hook
+  const { state: playerState, updatePlaybackPosition } = useBufferedPlayer({
+    src,
+    mimeType,
+    isAudio: false,
+  })
 
   useEffect(() => {
     if (!containerRef.current) return
-    const isHls = mimeType === 'application/x-mpegURL' || src.endsWith('.m3u8')
+    if (playerState.initializing) return
+
+    // 确定播放 URL
+    let playUrl: string
+    if (isHls) {
+      playUrl = src
+    } else if (playerState.blobUrl) {
+      playUrl = playerState.blobUrl
+    } else {
+      // 回退模式：直接使用原始 URL
+      playUrl = src
+    }
+
     const artOptions: any = {
       container: containerRef.current,
-      url: src,
+      url: playUrl,
       volume: 0.7,
-      autoplay: false,
+      autoplay: true,
       pip: true,
       fullscreen: true,
       setting: true,
-      customType: isHls ? {
+    }
+
+    // HLS 流需要使用 HLS.js
+    if (isHls) {
+      artOptions.customType = {
         m3u8: (video: HTMLVideoElement, url: string) => {
           import('hls.js').then(({ default: HlsLib }) => {
             if (hlsRef.current) {
               hlsRef.current.destroy()
             }
-            const hls = new HlsLib()
+
+            const hlsConfig = playerState.hlsConfig || {}
+            const hls = new HlsLib(hlsConfig)
             hlsRef.current = hls
+
+            // 监听播放进度，通知缓存管理器
+            hls.on(HlsLib.Events.FRAG_LOADED, (_event: any, data: any) => {
+              if (data.frag) {
+                updatePlaybackPosition((data.frag.startPTS || 0) * 1000000)
+              }
+            })
+
             hls.loadSource(url)
             hls.attachMedia(video)
           })
         }
-      } : {},
+      }
     }
+
     artRef.current = new Artplayer(artOptions)
     return () => {
       artRef.current?.destroy()
@@ -48,11 +138,136 @@ function VideoPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
         hlsRef.current = null
       }
     }
+  }, [src, playerState.initializing, playerState.ready, playerState.blobUrl])
+
+  // 初始化中显示加载状态
+  if (playerState.initializing) {
+    return (
+      <div style={{
+        width: '100%',
+        paddingBottom: '56.25%',
+        position: 'relative',
+        background: '#000',
+        borderRadius: 8,
+        overflow: 'hidden',
+      }}>
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: '#fff',
+          gap: 16,
+        }}>
+          <LoadingOutlined style={{ fontSize: 40 }} />
+          <div>正在预加载缓冲...</div>
+          {playerState.bufferState && (
+            <div style={{ width: 200 }}>
+              <Progress
+                percent={Math.round(playerState.bufferState.bufferProgress * 100)}
+                strokeColor="#1890ff"
+                size="small"
+              />
+              <Text style={{ fontSize: 12, color: '#999' }}>
+                已缓存 {playerState.bufferState.cachedSegments}/{playerState.bufferState.totalSegments} 片段
+              </Text>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // 初始化错误时回退到直接播放
+  if (playerState.error) {
+    return (
+      <div>
+        <div style={{ color: '#faad14', fontSize: 12, marginBottom: 8 }}>
+          缓冲预加载失败，已回退到直接播放模式
+        </div>
+        <DirectVideoPlayer src={src} />
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <BufferIndicator
+        bufferState={playerState.bufferState}
+        isDark={isDark}
+        downloadProgress={playerState.downloadProgress}
+        fallback={playerState.fallback}
+      />
+      <div style={{ width: '100%', height: 0, paddingBottom: '56.25%', position: 'relative' }}>
+        <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
+      </div>
+    </div>
+  )
+}
+
+// ===== 直接播放器（回退方案） =====
+function DirectVideoPlayer({ src }: { src: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const artRef = useRef<Artplayer | null>(null)
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    const artOptions: any = {
+      container: containerRef.current,
+      url: src,
+      volume: 0.7,
+      autoplay: true,
+      pip: true,
+      fullscreen: true,
+      setting: true,
+    }
+    artRef.current = new Artplayer(artOptions)
+    return () => {
+      artRef.current?.destroy()
+      artRef.current = null
+    }
   }, [src])
 
   return <div style={{ width: '100%', height: 0, paddingBottom: '56.25%', position: 'relative' }}>
     <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
   </div>
+}
+
+// ===== 带缓存队列的音频播放器 =====
+function AudioPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
+  const { isDark } = useTheme()
+  const audioRef = useRef<HTMLAudioElement>(null)
+
+  // 使用缓存播放器 hook
+  const { state: playerState } = useBufferedPlayer({
+    src,
+    mimeType,
+    isAudio: true,
+  })
+
+  // 确定音频播放 URL
+  const audioSrc = playerState.blobUrl || src
+
+  return (
+    <div>
+      <BufferIndicator
+        bufferState={playerState.bufferState}
+        isDark={isDark}
+        downloadProgress={playerState.downloadProgress}
+        fallback={playerState.fallback}
+      />
+      {playerState.initializing && (
+        <div style={{ textAlign: 'center', padding: '12px 0', color: isDark ? '#999' : '#666', fontSize: 13 }}>
+          <LoadingOutlined /> 正在预加载音频缓冲...
+        </div>
+      )}
+      <audio ref={audioRef} controls autoPlay style={{ width: '100%' }}>
+        <source src={audioSrc} type={mimeType || 'audio/mpeg'} />
+      </audio>
+    </div>
+  )
 }
 
 export default function Detail() {
@@ -63,7 +278,6 @@ export default function Detail() {
   const [episodes, setEpisodes] = useState<EpisodeItem[]>([])
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
-  const [showEpisodes, setShowEpisodes] = useState(false)
 
   const loadDetail = (mediaId: number) => {
     setLoading(true)
@@ -133,9 +347,7 @@ export default function Detail() {
           )}
           {playing && isAudio && (
             <div style={{ marginBottom: 32 }}>
-              <audio controls autoPlay style={{ width: '100%' }}>
-                <source src={item.stream_url || `/api/stream/${item.id}`} type={item.mime_type || 'audio/mpeg'} />
-              </audio>
+              <AudioPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} />
             </div>
           )}
 

@@ -1,0 +1,3 @@
+# 排除源映射文件和其他不需要上传到 Cloudflare 的文件
+*.map
+.DS_Store

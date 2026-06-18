@@ -74,7 +74,7 @@ app.get('/stream/:id', async (c) => {
 
   const contentLength = end - start + 1
 
-  const client = await getTGClient(c.env, source)
+  let client = await getTGClient(c.env, source)
 
   // ===== 所有初始化在返回 Response 前完成（避免 206 发出后浏览器等待超时断连）=====
   const channelIdStr = String(source.channel_id)
@@ -124,13 +124,37 @@ app.get('/stream/:id', async (c) => {
   const skipBytes = start - alignedStart
 
   // 取第一个 chunk（建立 DC 连接 + 预热），失败则提前报错
-  const firstResult = await client.call({
-    _: 'upload.getFile',
-    location: fileLocation,
-    offset: alignedStart,
-    limit: CHUNK_SIZE,
-    precise: true,
-  } as any, { kind: 'main', dcId: fileDcId } as any)
+  // AUTH_BYTES_INVALID: 跨 DC 认证导出失败，清除旧 auth key 后重建客户端重试
+  let firstResult: any
+  try {
+    firstResult = await client.call({
+      _: 'upload.getFile',
+      location: fileLocation,
+      offset: alignedStart,
+      limit: CHUNK_SIZE,
+      precise: true,
+    } as any, { kind: 'main', dcId: fileDcId } as any)
+  } catch (e: any) {
+    if (e?.message?.includes('AUTH_BYTES_INVALID')) {
+      console.warn('[stream] AUTH_BYTES_INVALID on first chunk, rebuilding client without cached auth keys')
+      await client.disconnect().catch(() => {})
+      const { KVStorage: KVStg } = await import('../tg/kv-storage')
+      const stg = new KVStg(c.env.KV, source.id)
+      await stg.deleteAllAuthKeys()
+
+      // 重建客户端（不加载旧 auth keys，让 mtcute 从 session 重新协商）
+      client = await getTGClient(c.env, source)
+      firstResult = await client.call({
+        _: 'upload.getFile',
+        location: fileLocation,
+        offset: alignedStart,
+        limit: CHUNK_SIZE,
+        precise: true,
+      } as any, { kind: 'main', dcId: fileDcId } as any)
+    } else {
+      throw e
+    }
+  }
 
   if ((firstResult as any)._ !== 'upload.file') {
     await client.disconnect()

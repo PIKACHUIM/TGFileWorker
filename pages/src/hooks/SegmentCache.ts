@@ -1,0 +1,362 @@
+/**
+ * 缓存队列管理器
+ *
+ * 通过 HTTP Range 请求实现视频分片预加载和缓存：
+ * - 播放前至少缓存 3 个片段
+ * - 队列至多缓存 10 个片段
+ * - 边播放边预加载后续片段
+ * - 自动清理已播放的远端片段
+ */
+
+// ===== 缓存队列配置 =====
+const SEGMENT_SIZE = 512 * 1024       // 每个片段 512KB
+const MIN_BUFFER_SEGMENTS = 3         // 播放前最少缓存片段数
+const MAX_BUFFER_SEGMENTS = 10        // 队列最大缓存片段数
+
+// ===== 缓存片段 =====
+export interface CacheSegment {
+  index: number
+  start: number
+  end: number
+  data: ArrayBuffer
+  timestamp: number
+}
+
+// ===== 缓存队列状态 =====
+export interface BufferState {
+  /** 已缓存的片段数 */
+  cachedSegments: number
+  /** 正在预加载的片段数 */
+  prefetching: number
+  /** 缓存进度 (0~1) */
+  bufferProgress: number
+  /** 是否正在缓冲（尚未达到最低缓存要求） */
+  isBuffering: boolean
+  /** 当前播放位置对应的片段索引 */
+  currentSegmentIndex: number
+  /** 总片段数 */
+  totalSegments: number
+  /** 缓存的字节数 */
+  cachedBytes: number
+  /** 文件总大小 */
+  totalBytes: number
+}
+
+type BufferStateListener = (state: BufferState) => void
+
+export class SegmentCacheManager {
+  private segments: Map<number, CacheSegment> = new Map()
+  private fileSize = 0
+  private totalSegments = 0
+  private currentSegmentIndex = 0
+  private prefetchingCount = 0
+  private abortController: AbortController | null = null
+  private url = ''
+  private listeners: Set<BufferStateListener> = new Set()
+  private destroyed = false
+  private initPromise: Promise<void> | null = null
+  private initResolved = false
+  private prefetchQueue: Set<number> = new Set()
+
+  constructor(url: string) {
+    this.url = url
+  }
+
+  // ===== 初始化：发 HEAD 请求获取文件大小 =====
+  async init(): Promise<void> {
+    if (this.initResolved) return
+    if (this.initPromise) return this.initPromise
+
+    this.initPromise = (async () => {
+      try {
+        const resp = await fetch(this.url, { method: 'HEAD' })
+        const contentLength = resp.headers.get('Content-Length')
+        if (!contentLength) {
+          // HEAD 不返回 Content-Length 时，尝试 Range 0-0
+          const rangeResp = await fetch(this.url, { headers: { Range: 'bytes=0-0' } })
+          const rangeHeader = rangeResp.headers.get('Content-Range')
+          if (rangeHeader) {
+            const match = rangeHeader.match(/\/(\d+)/)
+            if (match) this.fileSize = parseInt(match[1])
+          }
+        } else {
+          this.fileSize = parseInt(contentLength)
+        }
+
+        this.totalSegments = Math.ceil(this.fileSize / SEGMENT_SIZE)
+        this.initResolved = true
+        this.emitState()
+
+        // 预加载前 MIN_BUFFER_SEGMENTS 个片段
+        await this.prefetchSegments(0, MIN_BUFFER_SEGMENTS)
+      } catch (e) {
+        console.error('[SegmentCache] 初始化失败:', e)
+        throw e
+      }
+    })()
+
+    return this.initPromise
+  }
+
+  // ===== 预加载片段 =====
+  private async prefetchSegments(fromIndex: number, count: number): Promise<void> {
+    if (this.destroyed) return
+
+    const endIndex = Math.min(fromIndex + count, this.totalSegments)
+    const promises: Promise<void>[] = []
+
+    for (let i = fromIndex; i < endIndex; i++) {
+      if (this.segments.has(i) || this.prefetchQueue.has(i)) continue
+      this.prefetchQueue.add(i)
+      this.prefetchingCount++
+      promises.push(this.fetchSegment(i))
+    }
+
+    this.emitState()
+    await Promise.allSettled(promises)
+  }
+
+  private async fetchSegment(index: number): Promise<void> {
+    if (this.destroyed) {
+      this.prefetchQueue.delete(index)
+      return
+    }
+
+    const start = index * SEGMENT_SIZE
+    const end = Math.min(start + SEGMENT_SIZE - 1, this.fileSize - 1)
+
+    if (start >= this.fileSize) {
+      this.prefetchQueue.delete(index)
+      this.prefetchingCount = Math.max(0, this.prefetchingCount - 1)
+      return
+    }
+
+    const controller = new AbortController()
+    this.abortController = controller
+
+    try {
+      const headers: Record<string, string> = { Range: `bytes=${start}-${end}` }
+      // 如果 URL 已带 hash 参数则不需要额外认证头
+      if (!this.url.includes('hash=')) {
+        const token = localStorage.getItem('token')
+        if (token) headers['Authorization'] = `Bearer ${token}`
+      }
+
+      const resp = await fetch(this.url, { headers, signal: controller.signal })
+
+      if (!resp.ok && resp.status !== 206) {
+        throw new Error(`HTTP ${resp.status}`)
+      }
+
+      const data = await resp.arrayBuffer()
+      if (!this.destroyed) {
+        this.segments.set(index, {
+          index,
+          start,
+          end,
+          data,
+          timestamp: Date.now(),
+        })
+      }
+    } catch (e: any) {
+      if (e.name !== 'AbortError') {
+        console.warn(`[SegmentCache] 片段 ${index} 加载失败:`, e)
+      }
+    } finally {
+      this.prefetchQueue.delete(index)
+      this.prefetchingCount = Math.max(0, this.prefetchingCount - 1)
+      this.emitState()
+    }
+  }
+
+  // ===== 获取片段数据 =====
+  async getSegment(index: number): Promise<ArrayBuffer | null> {
+    if (index < 0 || index >= this.totalSegments) return null
+
+    const cached = this.segments.get(index)
+    if (cached) {
+      this.onSegmentAccess(index)
+      return cached.data
+    }
+
+    // 不在缓存中，等待加载
+    await this.prefetchSegments(index, 1)
+    const result = this.segments.get(index)
+    return result?.data ?? null
+  }
+
+  // ===== 同步获取（不触发预加载） =====
+  getSegmentSync(index: number): ArrayBuffer | null {
+    const cached = this.segments.get(index)
+    return cached?.data ?? null
+  }
+
+  // ===== 播放器访问某片段时触发预加载 =====
+  private onSegmentAccess(index: number): void {
+    this.currentSegmentIndex = index
+
+    // 计算前方连续缓存片段数
+    let cachedAhead = 0
+    for (let i = index + 1; i < this.totalSegments; i++) {
+      if (this.segments.has(i)) cachedAhead++
+      else break
+    }
+
+    // 前方缓存不足时触发预加载
+    if (cachedAhead < MIN_BUFFER_SEGMENTS) {
+      const prefetchFrom = index + 1 + cachedAhead
+      const prefetchCount = Math.min(
+        MAX_BUFFER_SEGMENTS - cachedAhead,
+        this.totalSegments - prefetchFrom
+      )
+      if (prefetchCount > 0) {
+        this.prefetchSegments(prefetchFrom, prefetchCount)
+      }
+    }
+
+    // 清理距离过远的旧片段
+    for (const key of this.segments.keys()) {
+      if (key < index - MAX_BUFFER_SEGMENTS * 2) {
+        this.segments.delete(key)
+      }
+    }
+
+    this.emitState()
+  }
+
+  // ===== 通知播放位置更新 =====
+  updatePlaybackPosition(byteOffset: number): void {
+    const segIndex = Math.floor(byteOffset / SEGMENT_SIZE)
+    if (segIndex !== this.currentSegmentIndex) {
+      this.onSegmentAccess(segIndex)
+    }
+  }
+
+  // ===== 获取当前缓冲状态 =====
+  getState(): BufferState {
+    const cachedSegments = this.segments.size
+    const cachedBytes = Array.from(this.segments.values())
+      .reduce((sum, s) => sum + s.data.byteLength, 0)
+
+    // 从当前位置向前连续缓存数
+    let consecutiveAhead = 0
+    for (let i = this.currentSegmentIndex; i < this.totalSegments; i++) {
+      if (this.segments.has(i)) consecutiveAhead++
+      else break
+    }
+
+    return {
+      cachedSegments,
+      prefetching: this.prefetchingCount,
+      bufferProgress: this.totalSegments > 0
+        ? consecutiveAhead / Math.min(this.totalSegments, MAX_BUFFER_SEGMENTS) : 0,
+      isBuffering: consecutiveAhead < MIN_BUFFER_SEGMENTS && this.totalSegments > 0,
+      currentSegmentIndex: this.currentSegmentIndex,
+      totalSegments: this.totalSegments,
+      cachedBytes,
+      totalBytes: this.fileSize,
+    }
+  }
+
+  // ===== 监听状态变化 =====
+  onStateChange(listener: BufferStateListener): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  private emitState(): void {
+    const state = this.getState()
+    for (const listener of this.listeners) {
+      try { listener(state) } catch { /* ignore */ }
+    }
+  }
+
+  // ===== 等待最低缓冲 =====
+  async waitForMinBuffer(): Promise<void> {
+    const check = () => {
+      let consecutive = 0
+      for (let i = this.currentSegmentIndex; i < this.totalSegments; i++) {
+        if (this.segments.has(i)) consecutive++
+        else break
+      }
+      return consecutive >= Math.min(MIN_BUFFER_SEGMENTS, this.totalSegments)
+    }
+
+    if (check()) return
+
+    return new Promise<void>((resolve) => {
+      const unsub = this.onStateChange(() => {
+        if (check()) {
+          unsub()
+          resolve()
+        }
+      })
+      if (check()) {
+        unsub()
+        resolve()
+      }
+    })
+  }
+
+  // ===== 获取片段大小常量 =====
+  static getSegmentSize(): number {
+    return SEGMENT_SIZE
+  }
+
+  // ===== 并行下载所有片段 =====
+  // 同时发起多个 Range 请求，提高下载速度
+  async downloadAll(
+    onProgress?: (loaded: number, total: number) => void
+  ): Promise<void> {
+    if (this.destroyed || this.totalSegments === 0) return
+
+    const CONCURRENT = 6  // 并行下载数
+    let nextIndex = 0
+
+    const downloadNext = async (): Promise<void> => {
+      while (nextIndex < this.totalSegments && !this.destroyed) {
+        const index = nextIndex++
+        if (this.segments.has(index)) continue
+
+        const start = index * SEGMENT_SIZE
+        const end = Math.min(start + SEGMENT_SIZE - 1, this.fileSize - 1)
+        if (start >= this.fileSize) continue
+
+        try {
+          const headers: Record<string, string> = { Range: `bytes=${start}-${end}` }
+          if (!this.url.includes('hash=')) {
+            const token = localStorage.getItem('token')
+            if (token) headers['Authorization'] = `Bearer ${token}`
+          }
+
+          const resp = await fetch(this.url, { headers })
+          if (!resp.ok && resp.status !== 206) continue
+
+          const data = await resp.arrayBuffer()
+          if (!this.destroyed) {
+            this.segments.set(index, {
+              index, start, end, data, timestamp: Date.now(),
+            })
+            onProgress?.(this.segments.size, this.totalSegments)
+          }
+        } catch {
+          // 单个片段失败不中断整体下载
+        }
+      }
+    }
+
+    // 启动 CONCURRENT 个并行下载任务
+    await Promise.allSettled(
+      Array.from({ length: CONCURRENT }, () => downloadNext())
+    )
+  }
+
+  // ===== 销毁 =====
+  destroy(): void {
+    this.destroyed = true
+    this.abortController?.abort()
+    this.segments.clear()
+    this.prefetchQueue.clear()
+    this.listeners.clear()
+  }
+}

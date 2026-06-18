@@ -45,44 +45,59 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
   const sessionStr = source.session_string || (await env.KV.get(sessionKey)) || undefined
 
   // 修复 @mtcute/core EarlyTimer 无限递归导致栈溢出的问题
-  // 即使 patchEarlyTimer 失败，也不阻塞客户端创建，
-  // 只是在某些边界情况下可能遇到栈溢出（非致命）
   try {
     await patchEarlyTimer()
   } catch (e) {
     console.warn('[getTGClient] patchEarlyTimer failed (non-fatal):', e)
   }
 
-  const storage = new KVStorage(env.KV, source.id)
-  await storage.preload()
+  let client: TelegramClient | null = null
+  let storage: KVStorage | null = null
 
-  // CF Workers 原生支持 WASM 模块导入（import xxx from '*.wasm'），
-  // esbuild/wrangler 在构建时自动处理 WASM 文件。
-  // 通过 getMtcuteWasmModule() 获取 WebAssembly.Module，
-  // 传给 WebCryptoProvider 的 wasmInput 参数，绕过 getWasmUrl() 的 URL 构建问题。
-  const wasmModule = getMtcuteWasmModule()
+  // 最多重试一次：如果 AUTH_BYTES_INVALID，清除旧 auth keys 后重建客户端
+  for (let attempt = 0; attempt < 2; attempt++) {
+    storage = new KVStorage(env.KV, source.id)
+    if (attempt === 0) {
+      // 第一次尝试：加载 KV 中的 auth keys
+      await storage.preload()
+    }
+    // 第二次尝试：不 preload，让 mtcute 从 session string 重新协商 auth keys
 
-  // 创建自定义 transport：DOProxyTransport 会根据 DC 参数动态创建 WS 代理连接
-  const doProxyTransport = new DOProxyTransport(env)
+    const wasmModule = getMtcuteWasmModule()
+    const doProxyTransport = new DOProxyTransport(env)
 
-  const client = new TelegramClient({
-    apiId: Number(source.api_id),
-    apiHash: source.api_hash,
-    storage,
-    crypto: new WebCryptoProvider({ wasmInput: wasmModule }),
-    transport: doProxyTransport,
-    disableUpdates: true,
-    // 只保留 main pool（1条连接），禁用 upload/download/downloadSmall pool
-    // 这些 pool 会并发打开额外 WebSocket，导致 Telegram 以 1011 拒绝
-    connectionCount: (kind) => kind === 'main' ? 1 : 0,
-  })
+    client = new TelegramClient({
+      apiId: Number(source.api_id),
+      apiHash: source.api_hash,
+      storage,
+      crypto: new WebCryptoProvider({ wasmInput: wasmModule }),
+      transport: doProxyTransport,
+      disableUpdates: true,
+      // 只保留 main pool（1条连接），禁用 upload/download/downloadSmall pool
+      // 这些 pool 会并发打开额外 WebSocket，导致 Telegram 以 1011 拒绝
+      connectionCount: (kind) => kind === 'main' ? 1 : 0,
+    })
 
-  // 以已有 session string 登录（不需要交互式验证码）
-  await client.start({ session: sessionStr })
+    try {
+      await client.start({ session: sessionStr })
 
-  // 保存最新 session 到 KV（供下次复用）
-  const exported = await client.exportSession()
-  if (exported) await env.KV.put(sessionKey, exported as string)
+      // 保存最新 session 到 KV（供下次复用）
+      const exported = await client.exportSession()
+      if (exported) await env.KV.put(sessionKey, exported as string)
 
-  return client
+      return client
+    } catch (e: any) {
+      if (attempt === 0 && e?.message?.includes('AUTH_BYTES_INVALID')) {
+        console.warn('[getTGClient] AUTH_BYTES_INVALID: auth key 与 session 不匹配，清除旧 auth keys 后重试')
+        await storage.deleteAllAuthKeys()
+        await client.destroy().catch(() => {})
+        client = null
+        continue
+      }
+      throw e
+    }
+  }
+
+  // 不应该到这里，但 TypeScript 需要
+  throw new Error('getTGClient: 不可达代码')
 }

@@ -25,7 +25,17 @@ class_name = "SessionGenDO"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["WebSocketProxy", "SessionGenDO"]
+new_sqlite_classes = []
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["WebSocketProxy", "SessionGenDO"]
+
+[assets]
+directory = "./dist-client"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
 
 [vars]
 JWT_SECRET = "*******************************"

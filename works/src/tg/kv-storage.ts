@@ -96,4 +96,13 @@ export class KVStorage extends MemoryStorage {
   async preload(): Promise<void> {
     await this._authKeysKV.loadFromKV()
   }
+
+  /**
+   * 清除所有已持久化的 auth keys（包括 KV 和内存）
+   * 用于 AUTH_BYTES_INVALID 等认证错误时，强制重新协商密钥
+   */
+  async deleteAllAuthKeys(): Promise<void> {
+    await this._authKeysKV.deleteAll()
+    console.log('[KVStorage] All auth keys deleted')
+  }
 }
