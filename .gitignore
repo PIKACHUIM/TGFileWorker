@@ -141,3 +141,12 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+.idea
+skill
+worker/wrangler.test.toml
+files
+.codebuddy
+works/wrangler.test.toml
+works/.wrangler
+works/.wrangler/tmp
+works/.build-test

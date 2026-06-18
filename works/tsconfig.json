@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "ESNext"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@mtcute/core": ["./node_modules/@mtcute/core/index.d.ts"],
+      "@mtcute/core/utils.js": ["./node_modules/@mtcute/core/utils.d.ts"],
+      "@mtcute/web": ["./node_modules/@mtcute/web/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}
