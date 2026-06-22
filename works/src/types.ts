@@ -3,6 +3,7 @@ export interface Env {
   KV: KVNamespace
   WS_PROXY: DurableObjectNamespace
   SESSION_GEN: DurableObjectNamespace
+  TG_CLIENT: DurableObjectNamespace
   ASSETS: Fetcher
   JWT_SECRET: string
   WORKER_URL: string

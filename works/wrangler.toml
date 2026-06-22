@@ -23,6 +23,10 @@ class_name = "WebSocketProxy"
 name = "SESSION_GEN"
 class_name = "SessionGenDO"
 
+[[durable_objects.bindings]]
+name = "TG_CLIENT"
+class_name = "TGClientDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = []
@@ -30,6 +34,10 @@ new_sqlite_classes = []
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["WebSocketProxy", "SessionGenDO"]
+
+[[migrations]]
+tag = "v3"
+new_classes = ["TGClientDO"]
 
 [assets]
 directory = "./dist-client"

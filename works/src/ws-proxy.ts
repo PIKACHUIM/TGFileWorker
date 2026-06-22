@@ -113,13 +113,14 @@ export class WebSocketProxy {
     try {
       // 使用 fetch + Upgrade 方式发起出站 WebSocket（CF Workers 支持）
       console.log('[WS-Proxy] Fetching upstream URL:', upstreamUrl)
+      const wsKey = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))))
       const upstreamResp = await fetch(upstreamUrl, {
         headers: {
           'Upgrade': 'websocket',
           'Connection': 'Upgrade',
-          'Sec-WebSocket-Protocol': 'binary',
+          'Sec-WebSocket-Key': wsKey,
+          'Sec-WebSocket-Version': '13',
           'Origin': `https://${targetHost}`,
-          'Host': targetHost,
         },
       })
       console.log('[WS-Proxy] Upstream response status:', upstreamResp.status, 'hasWebSocket:', !!upstreamResp.webSocket)

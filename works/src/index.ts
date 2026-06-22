@@ -12,6 +12,7 @@ import usersRoutes from './routes/users'
 import sessionGenRoutes from './routes/session-gen'
 import { WebSocketProxy } from './ws-proxy'
 import { SessionGenDO } from './tg/session-gen-do'
+import { TGClientDO } from './tg/tg-client-do'
 
 import { ensureMigrations } from './db'
 
@@ -44,5 +45,5 @@ app.all('*', async (c) => {
   return c.env.ASSETS.fetch(c.req.raw)
 })
 
-export { WebSocketProxy, SessionGenDO }
+export { WebSocketProxy, SessionGenDO, TGClientDO }
 export default app

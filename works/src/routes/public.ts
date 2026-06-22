@@ -85,8 +85,12 @@ app.get('/:id/episodes', async (c) => {
   const name = current.title || current.file_name
   if (!name) return c.json({ items: [], current_id: id })
 
-  // 清理名称用于匹配（去掉 # 前缀、分辨率等后缀）
-  const cleanName = name.replace(/^#+\s?/, '').replace(/\s*(4K|1080p|720p|高清|超清|HDR).*$/i, '').trim()
+  // 清理名称：去掉 # 前缀、集数标识、分辨率等，提取系列名
+  const cleanName = name
+    .replace(/^#+\s?/, '')
+    .replace(/[\s._-]*(S\d{1,2}E\d{1,3}|EP?\d{1,3}|第\d+[集话期])/gi, '')
+    .replace(/[\s._-]*(4K|2160p|1080p|720p|480p|高清|超清|HDR|BluRay|WEB-DL|x264|x265|HEVC).*$/i, '')
+    .trim()
   if (!cleanName || cleanName.length < 2) return c.json({ items: [], current_id: id })
 
   const rows = await c.env.DB.prepare(

@@ -234,6 +234,46 @@ export class DOProxyTransport implements TelegramTransport {
   }
 }
 
+/**
+ * 直连 Transport — 在 Durable Object 内部直接 fetch Telegram WebSocket，
+ * 无需再经过 WebSocketProxy DO 中转。
+ */
+export class DirectWSTransport implements TelegramTransport {
+  private _crypto?: ICryptoProvider
+  private _log?: Logger
+
+  setup(crypto: ICryptoProvider, log: Logger): void {
+    this._crypto = crypto
+    this._log = log
+  }
+
+  async connect(dc: BasicDcOption): Promise<ITelegramConnection> {
+    const subdomain = DC_SUBDOMAINS[dc.id]
+    if (!subdomain) throw new Error(`Unknown DC id: ${dc.id}`)
+    const targetHost = `${subdomain}.web.telegram.org`
+    const targetPath = dc.testMode ? 'apiws_test' : 'apiws'
+
+    this._log?.debug('[DirectWSTransport] connecting to %s/%s (DC %d)', targetHost, targetPath, dc.id)
+
+    const resp = await fetch(`https://${targetHost}/${targetPath}`, {
+      headers: {
+        'Upgrade': 'websocket',
+        'Connection': 'Upgrade',
+        'Origin': `https://${targetHost}`,
+      },
+    })
+
+    if (!resp.webSocket) throw new Error(`WS connect failed: ${resp.status}`)
+    const ws = resp.webSocket as unknown as CFWebSocket
+    ws.accept()
+    return new DOProxyConnection(ws)
+  }
+
+  packetCodec(_dc: BasicDcOption): IPacketCodec {
+    return new ObfuscatedPacketCodec(new IntermediatePacketCodec())
+  }
+}
+
 // ===== EarlyTimer 无限递归修复 =====
 // @mtcute/core 的 EarlyTimer.emitBefore() 在时间已过期时同步调用 _handler()，
 // 而 SessionConnection._flush() 结尾又调用 emitBefore()，形成无限递归导致栈溢出。

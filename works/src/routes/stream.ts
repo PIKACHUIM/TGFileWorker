@@ -2,7 +2,6 @@ import { Hono } from 'hono'
 import { requireAuthOrGuestMiddleware } from '../middleware/auth'
 import { getSetting, getSourceById } from '../db'
 import type { MediaItem } from '../db'
-import { getTGClient } from '../tg/client'
 import { computeFileHash, getShortHash, checkHash } from '../utils/hash'
 // getSetting used in /strm route below
 import type { Env } from '../types'
@@ -82,98 +81,29 @@ app.get('/stream/:id', async (c) => {
     }
   }
 
-  const client = await getTGClient(c.env, source)
-  try {
-    const channelIdStr = String(source.channel_id)
-    let bareChannelId: number
-    if (channelIdStr.startsWith('-100')) bareChannelId = Number(channelIdStr.slice(4))
-    else if (channelIdStr.startsWith('-')) bareChannelId = Number(channelIdStr.slice(1))
-    else bareChannelId = Number(channelIdStr)
-
-    const chResult = await client.call({
-      _: 'channels.getChannels',
-      id: [{ _: 'inputChannel', channelId: bareChannelId, accessHash: 0n }],
-    } as any)
-    const accessHash = (chResult as any).chats?.[0]?.accessHash
-    if (!accessHash) return c.json({ error: 'Cannot get accessHash' }, 500)
-
-    const msgs = await client.getMessages(
-      { _: 'inputPeerChannel', channelId: bareChannelId, accessHash },
-      [item.message_id],
-    )
-    const msg = msgs[0]
-    if (!msg) return c.json({ error: 'Message not found' }, 404)
-
-    const media = (msg as any).media as any
-    if (!media) return c.json({ error: 'No media' }, 404)
-
-    let fileLocation = media.location
-    if (typeof fileLocation === 'function') fileLocation = fileLocation()
-    const fileDcId: number = media.dcId ?? await client.getPrimaryDcId()
-
-    const CHUNK_SIZE = 512 * 1024
-    const contentLength = end - start + 1
-    const alignedStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE
-    const skipBytes = start - alignedStart
-
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
-    const writer = writable.getWriter()
-
-    ;(async () => {
-      try {
-        let offset = alignedStart
-        let bytesDownloaded = 0
-        let bytesSkipped = 0
-
-        while (bytesDownloaded < contentLength) {
-          const result = await client.call({
-            _: 'upload.getFile',
-            location: fileLocation,
-            offset,
-            limit: CHUNK_SIZE,
-            precise: true,
-          } as any, { kind: 'main', dcId: fileDcId } as any)
-
-          if ((result as any)._ !== 'upload.file') break
-          let data: Uint8Array = (result as any).bytes
-          offset += data.length
-
-          if (bytesSkipped < skipBytes) {
-            const toSkip = Math.min(skipBytes - bytesSkipped, data.length)
-            data = data.subarray(toSkip)
-            bytesSkipped += toSkip
-          }
-          if (data.length > 0) {
-            const remaining = contentLength - bytesDownloaded
-            const toWrite = data.length > remaining ? data.subarray(0, remaining) : data
-            await writer.write(toWrite)
-            bytesDownloaded += toWrite.length
-          }
-
-          if ((result as any).bytes.length < CHUNK_SIZE) break
-        }
-      } catch (e) {
-        console.error('[stream] MTProto error:', e)
-      } finally {
-        await client.destroy().catch(() => {})
-        writer.close()
-      }
-    })()
-
-    return new Response(readable, {
-      status,
-      headers: {
-        'Content-Type': item.mime_type || 'application/octet-stream',
-        'Content-Length': String(contentLength),
-        'Content-Range': status === 206 ? `bytes ${start}-${end}/${fileSize}` : '',
-        'Accept-Ranges': 'bytes',
-        'Content-Disposition': `inline; filename="${encodeURIComponent(item.file_name)}"`,
-      },
-    })
-  } catch (e: any) {
-    console.error('[stream] error:', e)
-    return c.json({ error: e.message }, 500)
+  // 委托给持久化 DO，复用已有 TelegramClient 连接，避免每次握手
+  const doId = c.env.TG_CLIENT.idFromName(`src:${source.id}`)
+  const doStub = c.env.TG_CLIENT.get(doId)
+  const contentLength = end - start + 1
+  const doResp = await doStub.fetch(new Request('http://do/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, messageId: item.message_id, channelId: source.channel_id, start, end }),
+  }))
+  if (!doResp.ok) {
+    const err = await doResp.json() as any
+    return c.json({ error: err.error }, doResp.status as any)
   }
+  return new Response(doResp.body, {
+    status,
+    headers: {
+      'Content-Type': item.mime_type || 'application/octet-stream',
+      'Content-Length': String(contentLength),
+      'Content-Range': status === 206 ? `bytes ${start}-${end}/${fileSize}` : '',
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': `inline; filename="${encodeURIComponent(item.file_name)}"`,
+    },
+  })
 })
 
 // 302 直链（TG CDN）
