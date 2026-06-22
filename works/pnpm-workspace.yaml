@@ -1,5 +1,8 @@
 allowBuilds:
   better-sqlite3: set this to true or false
+  bufferutil: false
+  es5-ext: false
   esbuild: false
   sharp: false
+  utf-8-validate: false
   workerd: false

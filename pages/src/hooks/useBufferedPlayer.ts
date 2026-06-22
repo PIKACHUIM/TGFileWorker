@@ -202,7 +202,7 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
     state,
     /** 通知缓存管理器播放位置更新 */
     updatePlaybackPosition,
-    /** 缓存管理器实例（高级用法） */
+    /** 缓存管理器实例（高级用法，如注册FLOOD_WAIT回调） */
     cacheManager: cacheRef,
   }
 }

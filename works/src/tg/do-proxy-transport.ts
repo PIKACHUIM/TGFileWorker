@@ -215,22 +215,21 @@ export class DOProxyTransport implements TelegramTransport {
   }
 
   async connect(dc: BasicDcOption): Promise<ITelegramConnection> {
-    const subdomain = DC_SUBDOMAINS[dc.id]
+    const dcId = dc.id
+    const subdomain = DC_SUBDOMAINS[dcId]
     if (!subdomain) {
-      throw new Error(`Unknown DC id: ${dc.id}, cannot determine WebSocket host`)
+      throw new Error(`Unknown DC id: ${dcId}, cannot determine WebSocket host`)
     }
     const targetHost = `${subdomain}.web.telegram.org`
     const targetPath = dc.testMode ? 'apiws_test' : 'apiws'
 
-    this._log?.debug('connecting to %s/%s (DC %d)', targetHost, targetPath, dc.id)
+    this._log?.debug('[DOProxyTransport] connecting to %s/%s (DC %d)', targetHost, targetPath, dcId)
 
     const { clientWs } = await createWSProxyConnection(this._env, targetHost, targetPath)
     return new DOProxyConnection(clientWs)
   }
 
   packetCodec(_dc: BasicDcOption): IPacketCodec {
-    // 与 @mtcute/web 的 WebSocketTransport 保持一致：
-    // 使用 ObfuscatedPacketCodec 包装 IntermediatePacketCodec
     return new ObfuscatedPacketCodec(new IntermediatePacketCodec())
   }
 }

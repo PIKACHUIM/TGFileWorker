@@ -4,6 +4,7 @@ import { getSetting, getSourceById } from '../db'
 import type { MediaItem } from '../db'
 import { getTGClient } from '../tg/client'
 import { computeFileHash, getShortHash, checkHash } from '../utils/hash'
+// getSetting used in /strm route below
 import type { Env } from '../types'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -36,6 +37,19 @@ app.get('/stream/:id', async (c) => {
   const rangeHeader = c.req.header('Range')
   const fileSize = item.file_size
 
+  // HEAD 请求只返回头信息，不需要建立 client 连接
+  if (c.req.method === 'HEAD') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Content-Type': item.mime_type || 'application/octet-stream',
+        'Content-Length': String(fileSize),
+        'Accept-Ranges': 'bytes',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(item.file_name)}"`,
+      },
+    })
+  }
+
   // ===== 小文件（≤ 20MB）且有 bot_token：通过 Bot API 获取 =====
   if (source.bot_token && fileSize > 0 && fileSize <= 20 * 1024 * 1024) {
     const fileId = await getBotFileId(source.bot_token, item.message_id, source.channel_id)
@@ -55,10 +69,6 @@ app.get('/stream/:id', async (c) => {
     }
   }
 
-  // ===== 大文件（> 20MB）或有 api_id+api_hash：通过 MTProto 流式传输 =====
-  // 使用 mtcute 的 downloadAsIterable 实现并行分块下载，
-  // 自动处理 DC 重定向（FILE_MIGRATE_%d）、连接池复用、自适应分块大小。
-
   let start = 0
   let end = fileSize - 1
   let status = 200
@@ -72,158 +82,98 @@ app.get('/stream/:id', async (c) => {
     }
   }
 
-  const contentLength = end - start + 1
-
-  let client = await getTGClient(c.env, source)
-
-  // ===== 所有初始化在返回 Response 前完成（避免 206 发出后浏览器等待超时断连）=====
-  const channelIdStr = String(source.channel_id)
-  let bareChannelId: number
-  if (channelIdStr.startsWith('-100')) {
-    bareChannelId = Number(channelIdStr.slice(4))
-  } else if (channelIdStr.startsWith('-')) {
-    bareChannelId = Number(channelIdStr.slice(1))
-  } else {
-    bareChannelId = Number(channelIdStr)
-  }
-
-  const chResult = await client.call({
-    _: 'channels.getChannels',
-    id: [{ _: 'inputChannel', channelId: bareChannelId, accessHash: 0n }],
-  } as any)
-  const accessHash = (chResult as any).chats?.[0]?.accessHash
-  if (!accessHash) {
-    await client.disconnect()
-    return c.json({ error: '无法获取频道 accessHash' }, 500)
-  }
-
-  const msgs = await client.getMessages(
-    { _: 'inputPeerChannel', channelId: bareChannelId, accessHash },
-    [item.message_id],
-  )
-  const msg = msgs[0]
-  if (!msg) {
-    await client.disconnect()
-    return c.json({ error: '消息不存在' }, 404)
-  }
-
-  const media = msg.media as any
-  if (!media) {
-    await client.disconnect()
-    return c.json({ error: '消息无媒体' }, 404)
-  }
-
-  let fileLocation = media.location
-  if (typeof fileLocation === 'function') fileLocation = fileLocation()
-  const fileDcId: number = media.dcId ?? await client.getPrimaryDcId()
-
-  // 下载参数
-  // precise=true 要求 offset 必须是 limit 的整数倍，否则返回 LIMIT_INVALID
-  const CHUNK_SIZE = 256 * 1024 // 256KB
-  const alignedStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE
-  const skipBytes = start - alignedStart
-
-  // 取第一个 chunk（建立 DC 连接 + 预热），失败则提前报错
-  // AUTH_BYTES_INVALID: 跨 DC 认证导出失败，清除旧 auth key 后重建客户端重试
-  let firstResult: any
+  const client = await getTGClient(c.env, source)
   try {
-    firstResult = await client.call({
-      _: 'upload.getFile',
-      location: fileLocation,
-      offset: alignedStart,
-      limit: CHUNK_SIZE,
-      precise: true,
-    } as any, { kind: 'main', dcId: fileDcId } as any)
+    const channelIdStr = String(source.channel_id)
+    let bareChannelId: number
+    if (channelIdStr.startsWith('-100')) bareChannelId = Number(channelIdStr.slice(4))
+    else if (channelIdStr.startsWith('-')) bareChannelId = Number(channelIdStr.slice(1))
+    else bareChannelId = Number(channelIdStr)
+
+    const chResult = await client.call({
+      _: 'channels.getChannels',
+      id: [{ _: 'inputChannel', channelId: bareChannelId, accessHash: 0n }],
+    } as any)
+    const accessHash = (chResult as any).chats?.[0]?.accessHash
+    if (!accessHash) return c.json({ error: 'Cannot get accessHash' }, 500)
+
+    const msgs = await client.getMessages(
+      { _: 'inputPeerChannel', channelId: bareChannelId, accessHash },
+      [item.message_id],
+    )
+    const msg = msgs[0]
+    if (!msg) return c.json({ error: 'Message not found' }, 404)
+
+    const media = (msg as any).media as any
+    if (!media) return c.json({ error: 'No media' }, 404)
+
+    let fileLocation = media.location
+    if (typeof fileLocation === 'function') fileLocation = fileLocation()
+    const fileDcId: number = media.dcId ?? await client.getPrimaryDcId()
+
+    const CHUNK_SIZE = 512 * 1024
+    const contentLength = end - start + 1
+    const alignedStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE
+    const skipBytes = start - alignedStart
+
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+    const writer = writable.getWriter()
+
+    ;(async () => {
+      try {
+        let offset = alignedStart
+        let bytesDownloaded = 0
+        let bytesSkipped = 0
+
+        while (bytesDownloaded < contentLength) {
+          const result = await client.call({
+            _: 'upload.getFile',
+            location: fileLocation,
+            offset,
+            limit: CHUNK_SIZE,
+            precise: true,
+          } as any, { kind: 'main', dcId: fileDcId } as any)
+
+          if ((result as any)._ !== 'upload.file') break
+          let data: Uint8Array = (result as any).bytes
+          offset += data.length
+
+          if (bytesSkipped < skipBytes) {
+            const toSkip = Math.min(skipBytes - bytesSkipped, data.length)
+            data = data.subarray(toSkip)
+            bytesSkipped += toSkip
+          }
+          if (data.length > 0) {
+            const remaining = contentLength - bytesDownloaded
+            const toWrite = data.length > remaining ? data.subarray(0, remaining) : data
+            await writer.write(toWrite)
+            bytesDownloaded += toWrite.length
+          }
+
+          if ((result as any).bytes.length < CHUNK_SIZE) break
+        }
+      } catch (e) {
+        console.error('[stream] MTProto error:', e)
+      } finally {
+        await client.disconnect().catch(() => {})
+        writer.close()
+      }
+    })()
+
+    return new Response(readable, {
+      status,
+      headers: {
+        'Content-Type': item.mime_type || 'application/octet-stream',
+        'Content-Length': String(contentLength),
+        'Content-Range': status === 206 ? `bytes ${start}-${end}/${fileSize}` : '',
+        'Accept-Ranges': 'bytes',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(item.file_name)}"`,
+      },
+    })
   } catch (e: any) {
-    if (e?.message?.includes('AUTH_BYTES_INVALID')) {
-      console.warn('[stream] AUTH_BYTES_INVALID on first chunk, rebuilding client without cached auth keys')
-      await client.disconnect().catch(() => {})
-      const { KVStorage: KVStg } = await import('../tg/kv-storage')
-      const stg = new KVStg(c.env.KV, source.id)
-      await stg.deleteAllAuthKeys()
-
-      // 重建客户端（不加载旧 auth keys，让 mtcute 从 session 重新协商）
-      client = await getTGClient(c.env, source)
-      firstResult = await client.call({
-        _: 'upload.getFile',
-        location: fileLocation,
-        offset: alignedStart,
-        limit: CHUNK_SIZE,
-        precise: true,
-      } as any, { kind: 'main', dcId: fileDcId } as any)
-    } else {
-      throw e
-    }
+    console.error('[stream] error:', e)
+    return c.json({ error: e.message }, 500)
   }
-
-  if ((firstResult as any)._ !== 'upload.file') {
-    await client.disconnect()
-    return c.json({ error: '文件获取失败' }, 500)
-  }
-
-  // ===== 以下才开始流式传输 =====
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
-  const writer = writable.getWriter()
-
-  ;(async () => {
-    try {
-      let offset = alignedStart + (firstResult as any).bytes.length
-      let bytesDownloaded = 0
-      let bytesSkipped = 0
-
-      // 处理第一个 chunk
-      let data: Uint8Array = (firstResult as any).bytes
-      if (bytesSkipped < skipBytes) {
-        const toSkip = Math.min(skipBytes - bytesSkipped, data.length)
-        data = data.subarray(toSkip)
-        bytesSkipped += toSkip
-      }
-      if (data.length > 0) {
-        const remaining = contentLength - bytesDownloaded
-        const toWrite = data.length > remaining ? data.subarray(0, remaining) : data
-        await writer.write(toWrite)
-        bytesDownloaded += toWrite.length
-      }
-
-      // 继续下载剩余 chunks
-      while (bytesDownloaded < contentLength) {
-        const result = await client.call({
-          _: 'upload.getFile',
-          location: fileLocation,
-          offset,
-          limit: CHUNK_SIZE,
-          precise: true,
-        } as any, { kind: 'main', dcId: fileDcId } as any)
-
-        if ((result as any)._ !== 'upload.file') break
-        const raw: Uint8Array = (result as any).bytes
-        offset += raw.length
-
-        const remaining = contentLength - bytesDownloaded
-        const toWrite = raw.length > remaining ? raw.subarray(0, remaining) : raw
-        await writer.write(toWrite)
-        bytesDownloaded += toWrite.length
-
-        if (raw.length < CHUNK_SIZE) break
-      }
-    } catch (e) {
-      console.error('Stream error:', e)
-    } finally {
-      await client.disconnect()
-      writer.close()
-    }
-  })()
-
-  return new Response(readable, {
-    status,
-    headers: {
-      'Content-Type': item.mime_type || 'application/octet-stream',
-      'Content-Length': String(contentLength),
-      'Content-Range': status === 206 ? `bytes ${start}-${end}/${fileSize}` : '',
-      'Accept-Ranges': 'bytes',
-      'Content-Disposition': `inline; filename="${encodeURIComponent(item.file_name)}"`,
-    },
-  })
 })
 
 // 302 直链（TG CDN）

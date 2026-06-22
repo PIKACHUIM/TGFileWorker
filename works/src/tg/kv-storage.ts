@@ -40,6 +40,20 @@ class KVAuthKeysRepository {
   }
 
   async set(dc: number, key: Uint8Array | null): Promise<void> {
+    const existing = this._mem.get(dc)
+
+    // 值未变化，不写入 KV
+    if (key && existing && key.length === existing.length) {
+      let same = true
+      for (let i = 0; i < key.length; i++) {
+        if (key[i] !== existing[i]) {
+          same = false
+          break
+        }
+      }
+      if (same) return
+    }
+
     if (key) {
       this._mem.set(dc, key)
       await this._kv.put(`${this._prefix}:ak:${dc}`, encodeKey(key))

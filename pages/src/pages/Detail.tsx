@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip } from 'antd'
+import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip, Modal } from 'antd'
 import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined } from '@ant-design/icons'
 import { getMediaDetail, getEpisodes, type MediaItem, type EpisodeItem } from '../api'
 import { formatSize } from '../utils'
 import { useTheme } from '../theme'
 import Artplayer from 'artplayer'
 import { useBufferedPlayer, type BufferState } from '../hooks/useBufferedPlayer'
+import type { FloodWaitInfo } from '../hooks/SegmentCache'
 
 const { Title, Paragraph, Text } = Typography
 
@@ -63,7 +64,7 @@ function BufferIndicator({ bufferState, isDark, downloadProgress, fallback }: {
 }
 
 // ===== 带缓存队列的视频播放器 =====
-function VideoPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
+function VideoPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const hlsRef = useRef<any>(null)
@@ -71,11 +72,20 @@ function VideoPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
   const isHls = mimeType === 'application/x-mpegURL' || src.endsWith('.m3u8')
 
   // 使用缓存播放器 hook
-  const { state: playerState, updatePlaybackPosition } = useBufferedPlayer({
+  const { state: playerState, updatePlaybackPosition, cacheManager } = useBufferedPlayer({
     src,
     mimeType,
     isAudio: false,
   })
+
+  // 注册 FLOOD_WAIT 回调
+  useEffect(() => {
+    if (!cacheManager.current) return
+    const unsub = cacheManager.current.onFloodWait((info) => {
+      onFloodWait?.(info)
+    })
+    return unsub
+  }, [cacheManager.current, onFloodWait])
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -236,16 +246,25 @@ function DirectVideoPlayer({ src }: { src: string }) {
 }
 
 // ===== 带缓存队列的音频播放器 =====
-function AudioPlayer({ src, mimeType }: { src: string; mimeType?: string }) {
+function AudioPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void }) {
   const { isDark } = useTheme()
   const audioRef = useRef<HTMLAudioElement>(null)
 
   // 使用缓存播放器 hook
-  const { state: playerState } = useBufferedPlayer({
+  const { state: playerState, cacheManager } = useBufferedPlayer({
     src,
     mimeType,
     isAudio: true,
   })
+
+  // 注册 FLOOD_WAIT 回调
+  useEffect(() => {
+    if (!cacheManager.current) return
+    const unsub = cacheManager.current.onFloodWait((info) => {
+      onFloodWait?.(info)
+    })
+    return unsub
+  }, [cacheManager.current, onFloodWait])
 
   // 确定音频播放 URL
   const audioSrc = playerState.blobUrl || src
@@ -278,6 +297,7 @@ export default function Detail() {
   const [episodes, setEpisodes] = useState<EpisodeItem[]>([])
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
+  const [floodWait, setFloodWait] = useState<FloodWaitInfo | null>(null)
 
   const loadDetail = (mediaId: number) => {
     setLoading(true)
@@ -308,6 +328,10 @@ export default function Detail() {
 
   const handleEpisodeSwitch = (epId: number) => {
     nav(`/media/${epId}`)
+  }
+
+  const handleFloodWait = (info: FloodWaitInfo) => {
+    setFloodWait(info)
   }
 
   return (
@@ -342,12 +366,12 @@ export default function Detail() {
           {/* 播放器 - 单独区域，下方留出间距 */}
           {playing && isVideo && (
             <div style={{ marginBottom: 32 }}>
-              <VideoPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} />
+              <VideoPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} />
             </div>
           )}
           {playing && isAudio && (
             <div style={{ marginBottom: 32 }}>
-              <AudioPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} />
+              <AudioPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} />
             </div>
           )}
 
@@ -469,6 +493,137 @@ export default function Detail() {
           )}
         </div>
       </Layout.Content>
+
+      {/* FLOOD_WAIT 错误提示 */}
+      {floodWait && (
+        <FloodWaitModal
+          info={floodWait}
+          isDark={isDark}
+          onClose={() => setFloodWait(null)}
+          onRetry={() => {
+            setFloodWait(null)
+            // 重新播放（会重新初始化缓存管理器）
+            setPlaying(false)
+            setTimeout(() => setPlaying(true), 500)
+          }}
+        />
+      )}
     </Layout>
+  )
+}
+
+// ===== FLOOD_WAIT 提示模态框 =====
+function FloodWaitModal({ info, isDark, onClose, onRetry }: {
+  info: FloodWaitInfo
+  isDark: boolean
+  onClose: () => void
+  onRetry: () => void
+}) {
+  const [countdown, setCountdown] = useState(info.waitSeconds)
+  const [canRetry, setCanRetry] = useState(info.waitSeconds <= 30)
+
+  useEffect(() => {
+    if (info.waitSeconds > 30) {
+      // 等待时间超过30秒，不自动重试，只显示提示
+      return
+    }
+
+    // 开始倒计时
+    setCountdown(info.waitSeconds)
+    const timer = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) {
+          clearInterval(timer)
+          setCanRetry(true)
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [info.waitSeconds])
+
+  const handleRetry = () => {
+    onRetry()
+  }
+
+  return (
+    <Modal
+      title={
+        <span style={{ color: '#faad14' }}>
+          <LoadingOutlined style={{ marginRight: 8 }} />
+          Telegram API 限流
+        </span>
+      }
+      open={true}
+      closable={canRetry}
+      maskClosable={false}
+      footer={[
+        <Button key="close" onClick={onClose} disabled={!canRetry}>
+          关闭
+        </Button>,
+        <Button key="retry" type="primary" onClick={handleRetry} disabled={!canRetry}>
+          {canRetry ? '重试播放' : `请等待 ${countdown} 秒`}
+        </Button>,
+      ]}
+      onCancel={onClose}
+      style={{ top: 100 }}
+    >
+      <div style={{ padding: '16px 0' }}>
+        <div style={{ 
+          padding: 16, 
+          background: isDark ? '#2a2a2a' : '#fff7e6', 
+          borderRadius: 8,
+          border: `1px solid ${isDark ? '#594214' : '#ffd591'}`,
+          marginBottom: 16,
+        }}>
+          <Text strong style={{ color: '#faad14', fontSize: 16 }}>
+            ⚠️ 请求频率过高
+          </Text>
+          <div style={{ marginTop: 12, color: isDark ? '#e0e0e0' : undefined }}>
+            <p>{info.message || `Telegram API 限流，请等待 ${info.waitSeconds} 秒后重试`}</p>
+            {info.waitSeconds > 30 && (
+              <p style={{ color: '#ff4d4f', marginTop: 8 }}>
+                等待时间较长（{info.waitSeconds}秒），建议：
+                <ul style={{ marginTop: 8, paddingLeft: 20 }}>
+                  <li>使用 Bot Token 模式（如果已配置）</li>
+                  <li>下载后本地播放</li>
+                  <li>稍后再试</li>
+                </ul>
+              </p>
+            )}
+          </div>
+        </div>
+
+        {!canRetry && (
+          <div style={{ textAlign: 'center' }}>
+            <Progress
+              type="circle"
+              percent={Math.round(((info.waitSeconds - countdown) / info.waitSeconds) * 100)}
+              format={() => `${countdown}s`}
+              width={80}
+              strokeColor="#faad14"
+            />
+            <div style={{ marginTop: 8, color: '#999' }}>
+              自动重试倒计时
+            </div>
+          </div>
+        )}
+
+        {canRetry && (
+          <div style={{ 
+            padding: 12, 
+            background: isDark ? '#1f2a1f' : '#f6ffed',
+            borderRadius: 8,
+            border: `1px solid ${isDark ? '#237804' : '#b7eb8f'}`,
+          }}>
+            <Text style={{ color: '#52c41a' }}>
+              ✅ 可以重试了！点击"重试播放"按钮继续。
+            </Text>
+          </div>
+        )}
+      </div>
+    </Modal>
   )
 }

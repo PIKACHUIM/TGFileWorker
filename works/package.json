@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "mkdir -p dist-client && wrangler dev",
-    "dev:test": "mkdir -p dist-client && wrangler dev -c wrangler.test.toml",
+    "dev": "node -e \"require('fs').mkdirSync('dist-client',{recursive:true})\" && wrangler dev",
+    "dev:test": "node -e \"require('fs').mkdirSync('dist-client',{recursive:true})\" && wrangler dev -c wrangler.test.toml",
     "build:frontend": "cd ../pages && pnpm install && pnpm run build",
     "deploy": "pnpm run build:frontend && wrangler deploy",
     "deploy:test": "pnpm run build:frontend && wrangler deploy -c wrangler.test.toml",
@@ -16,7 +16,8 @@
     "@mtcute/web": "^0.30.1",
     "bcryptjs": "^3.0.3",
     "hono": "^4.4.0",
-    "jose": "^5.6.3"
+    "jose": "^5.6.3",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240725.0",

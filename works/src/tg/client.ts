@@ -15,10 +15,6 @@ const SIMD_AVAILABLE = /* @__PURE__ */ WebAssembly.validate(new Uint8Array(
   [0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]
 ))
 
-/**
- * 获取 mtcute WASM 模块（WebAssembly.Module）
- * CF Workers 运行在 V8 引擎上，支持 WASM SIMD，优先使用 SIMD 版本
- */
 function getMtcuteWasmModule(): WebAssembly.Module {
   if (SIMD_AVAILABLE) {
     console.log('[WASM] Using SIMD WASM module')
@@ -41,10 +37,8 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
   }
 
   const sessionKey = `session:${source.id}`
-  // 优先用来源里手填的 session，否则从 KV 取上次保存的
   const sessionStr = source.session_string || (await env.KV.get(sessionKey)) || undefined
 
-  // 修复 @mtcute/core EarlyTimer 无限递归导致栈溢出的问题
   try {
     await patchEarlyTimer()
   } catch (e) {
@@ -54,14 +48,11 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
   let client: TelegramClient | null = null
   let storage: KVStorage | null = null
 
-  // 最多重试一次：如果 AUTH_BYTES_INVALID，清除旧 auth keys 后重建客户端
   for (let attempt = 0; attempt < 2; attempt++) {
     storage = new KVStorage(env.KV, source.id)
     if (attempt === 0) {
-      // 第一次尝试：加载 KV 中的 auth keys
       await storage.preload()
     }
-    // 第二次尝试：不 preload，让 mtcute 从 session string 重新协商 auth keys
 
     const wasmModule = getMtcuteWasmModule()
     const doProxyTransport = new DOProxyTransport(env)
@@ -73,22 +64,17 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
       crypto: new WebCryptoProvider({ wasmInput: wasmModule }),
       transport: doProxyTransport,
       disableUpdates: true,
-      // 只保留 main pool（1条连接），禁用 upload/download/downloadSmall pool
-      // 这些 pool 会并发打开额外 WebSocket，导致 Telegram 以 1011 拒绝
       connectionCount: (kind) => kind === 'main' ? 1 : 0,
     })
 
     try {
       await client.start({ session: sessionStr })
-
-      // 保存最新 session 到 KV（供下次复用）
       const exported = await client.exportSession()
       if (exported) await env.KV.put(sessionKey, exported as string)
-
       return client
     } catch (e: any) {
       if (attempt === 0 && e?.message?.includes('AUTH_BYTES_INVALID')) {
-        console.warn('[getTGClient] AUTH_BYTES_INVALID: auth key 与 session 不匹配，清除旧 auth keys 后重试')
+        console.warn('[getTGClient] AUTH_BYTES_INVALID: clearing and retrying')
         await storage.deleteAllAuthKeys()
         await client.destroy().catch(() => {})
         client = null
@@ -98,6 +84,5 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
     }
   }
 
-  // 不应该到这里，但 TypeScript 需要
-  throw new Error('getTGClient: 不可达代码')
+  throw new Error('getTGClient: unreachable')
 }

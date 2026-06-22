@@ -5,13 +5,14 @@
  * - 播放前至少缓存 3 个片段
  * - 队列至多缓存 10 个片段
  * - 边播放边预加载后续片段
- * - 自动清理已播放的远端片段
+ * - 使用主动预加载机制，而非被动触发
  */
 
 // ===== 缓存队列配置 =====
-const SEGMENT_SIZE = 512 * 1024       // 每个片段 512KB
-const MIN_BUFFER_SEGMENTS = 3         // 播放前最少缓存片段数
-const MAX_BUFFER_SEGMENTS = 10        // 队列最大缓存片段数
+const SEGMENT_SIZE = 1024 * 1024       // 每个片段 512KB
+const MIN_BUFFER_SEGMENTS = 3          // 播放前最少缓存片段数
+const MAX_BUFFER_SEGMENTS = 10         // 队列最大缓存片段数
+const PREFETCH_TRIGGER_THRESHOLD = 5   // 当前方缓存少于此值时触发预加载
 
 // ===== 缓存片段 =====
 export interface CacheSegment {
@@ -21,6 +22,15 @@ export interface CacheSegment {
   data: ArrayBuffer
   timestamp: number
 }
+
+// ===== FLOOD_WAIT 错误回调 =====
+export interface FloodWaitInfo {
+  waitSeconds: number
+  message: string
+  retryAfter: number
+}
+
+type FloodWaitCallback = (info: FloodWaitInfo) => void
 
 // ===== 缓存队列状态 =====
 export interface BufferState {
@@ -40,6 +50,12 @@ export interface BufferState {
   cachedBytes: number
   /** 文件总大小 */
   totalBytes: number
+  /** 前方连续缓存片段数 */
+  consecutiveAhead: number
+  /** 是否有 FLOOD_WAIT 错误 */
+  hasFloodWait: boolean
+  /** FLOOD_WAIT 等待秒数 */
+  floodWaitSeconds: number
 }
 
 type BufferStateListener = (state: BufferState) => void
@@ -57,6 +73,14 @@ export class SegmentCacheManager {
   private initPromise: Promise<void> | null = null
   private initResolved = false
   private prefetchQueue: Set<number> = new Set()
+  private floodWaitCallback: FloodWaitCallback | null = null
+  private hasFloodWait = false
+  private floodWaitSeconds = 0
+  
+  // ===== 主动预加载相关 =====
+  private prefetchTarget = 0          // 目标预加载位置
+  private isPrefetching = false       // 是否正在主动预加载
+  private prefetchTaskRunning = false  // 预加载任务是否正在运行
 
   constructor(url: string) {
     this.url = url
@@ -87,7 +111,7 @@ export class SegmentCacheManager {
         this.initResolved = true
         this.emitState()
 
-        // 预加载前 MIN_BUFFER_SEGMENTS 个片段
+        // 预加载前 MIN_BUFFER_SEGMENTS 个片段（主动等待完成）
         await this.prefetchSegments(0, MIN_BUFFER_SEGMENTS)
       } catch (e) {
         console.error('[SegmentCache] 初始化失败:', e)
@@ -96,6 +120,71 @@ export class SegmentCacheManager {
     })()
 
     return this.initPromise
+  }
+
+  // ===== 主动预加载任务 =====
+  // 持续预加载直到达到目标位置或文件末尾
+  private async startPrefetchTask(): Promise<void> {
+    if (this.prefetchTaskRunning || this.destroyed) return
+    this.prefetchTaskRunning = true
+    this.isPrefetching = true
+
+    while (!this.destroyed) {
+      // 计算需要预加载的片段
+      const nextIndex = this.findNextPrefetchIndex()
+      if (nextIndex === -1) {
+        // 没有需要预加载的片段了
+        break
+      }
+
+      // 检查是否超过最大缓存限制
+      const cachedAhead = this.countConsecutiveAhead()
+      if (cachedAhead >= MAX_BUFFER_SEGMENTS) {
+        // 已达到最大缓存，等待播放进度前进
+        break
+      }
+
+      // 加载这个片段
+      this.prefetchingCount++
+      this.prefetchQueue.add(nextIndex)
+      this.emitState()
+
+      try {
+        await this.fetchSegment(nextIndex)
+      } catch {
+        // 单个片段加载失败不中断整体预加载
+      }
+
+      // 继续循环加载下一个
+    }
+
+    this.isPrefetching = false
+    this.prefetchTaskRunning = false
+    this.emitState()
+  }
+
+  // ===== 找到下一个需要预加载的片段索引 =====
+  private findNextPrefetchIndex(): number {
+    // 从当前位置开始，找到第一个未缓存的片段
+    for (let i = this.currentSegmentIndex; i < this.totalSegments; i++) {
+      if (!this.segments.has(i) && !this.prefetchQueue.has(i)) {
+        return i
+      }
+    }
+    return -1
+  }
+
+  // ===== 计算当前位置前方连续缓存的片段数 =====
+  private countConsecutiveAhead(): number {
+    let count = 0
+    for (let i = this.currentSegmentIndex; i < this.totalSegments; i++) {
+      if (this.segments.has(i)) {
+        count++
+      } else {
+        break
+      }
+    }
+    return count
   }
 
   // ===== 预加载片段 =====
@@ -144,6 +233,23 @@ export class SegmentCacheManager {
 
       const resp = await fetch(this.url, { headers, signal: controller.signal })
 
+      // 检查是否是 429 FLOOD_WAIT 错误
+      if (resp.status === 429) {
+        const errorData = await resp.json().catch(() => ({}))
+        if (errorData.error === 'FLOOD_WAIT' && errorData.waitSeconds) {
+          this.hasFloodWait = true
+          this.floodWaitSeconds = errorData.waitSeconds
+          this.emitState()
+          this.floodWaitCallback?.({
+            waitSeconds: errorData.waitSeconds,
+            message: errorData.message || `Telegram API 限流，请等待 ${errorData.waitSeconds} 秒后重试`,
+            retryAfter: errorData.retryAfter || errorData.waitSeconds,
+          })
+          throw new Error(`FLOOD_WAIT:${errorData.waitSeconds}`)
+        }
+        throw new Error(`HTTP ${resp.status}`)
+      }
+
       if (!resp.ok && resp.status !== 206) {
         throw new Error(`HTTP ${resp.status}`)
       }
@@ -166,6 +272,24 @@ export class SegmentCacheManager {
       this.prefetchQueue.delete(index)
       this.prefetchingCount = Math.max(0, this.prefetchingCount - 1)
       this.emitState()
+
+      // 如果当前预加载任务正在运行，继续预加载下一个
+      if (this.prefetchTaskRunning && !this.destroyed) {
+        // 异步继续预加载，不阻塞当前任务
+        setTimeout(() => this.continuePrefetchIfNeeded(), 0)
+      }
+    }
+  }
+
+  // ===== 继续预加载（如果需要）=====
+  private continuePrefetchIfNeeded(): void {
+    if (this.destroyed || this.prefetchTaskRunning) return
+
+    const consecutiveAhead = this.countConsecutiveAhead()
+    
+    // 如果前方缓存不足，继续预加载
+    if (consecutiveAhead < PREFETCH_TRIGGER_THRESHOLD && consecutiveAhead < MAX_BUFFER_SEGMENTS) {
+      this.startPrefetchTask()
     }
   }
 
@@ -179,8 +303,12 @@ export class SegmentCacheManager {
       return cached.data
     }
 
-    // 不在缓存中，等待加载
-    await this.prefetchSegments(index, 1)
+    // 不在缓存中，优先加载这个片段
+    this.prefetchQueue.add(index)
+    this.prefetchingCount++
+    this.emitState()
+
+    await this.fetchSegment(index)
     const result = this.segments.get(index)
     return result?.data ?? null
   }
@@ -193,35 +321,33 @@ export class SegmentCacheManager {
 
   // ===== 播放器访问某片段时触发预加载 =====
   private onSegmentAccess(index: number): void {
+    // 更新当前位置
+    const prevIndex = this.currentSegmentIndex
     this.currentSegmentIndex = index
 
-    // 计算前方连续缓存片段数
-    let cachedAhead = 0
-    for (let i = index + 1; i < this.totalSegments; i++) {
-      if (this.segments.has(i)) cachedAhead++
-      else break
-    }
-
-    // 前方缓存不足时触发预加载
-    if (cachedAhead < MIN_BUFFER_SEGMENTS) {
-      const prefetchFrom = index + 1 + cachedAhead
-      const prefetchCount = Math.min(
-        MAX_BUFFER_SEGMENTS - cachedAhead,
-        this.totalSegments - prefetchFrom
-      )
-      if (prefetchCount > 0) {
-        this.prefetchSegments(prefetchFrom, prefetchCount)
-      }
-    }
-
-    // 清理距离过远的旧片段
+    // 清理距离过远的旧片段（释放内存）
     for (const key of this.segments.keys()) {
       if (key < index - MAX_BUFFER_SEGMENTS * 2) {
         this.segments.delete(key)
       }
     }
 
+    // 触发主动预加载
+    this.triggerPrefetch()
+
     this.emitState()
+  }
+
+  // ===== 触发主动预加载 =====
+  private triggerPrefetch(): void {
+    if (this.destroyed) return
+
+    const consecutiveAhead = this.countConsecutiveAhead()
+    
+    // 如果前方缓存不足阈值，启动预加载任务
+    if (consecutiveAhead < PREFETCH_TRIGGER_THRESHOLD && !this.prefetchTaskRunning) {
+      this.startPrefetchTask()
+    }
   }
 
   // ===== 通知播放位置更新 =====
@@ -255,6 +381,9 @@ export class SegmentCacheManager {
       totalSegments: this.totalSegments,
       cachedBytes,
       totalBytes: this.fileSize,
+      consecutiveAhead,
+      hasFloodWait: this.hasFloodWait,
+      floodWaitSeconds: this.floodWaitSeconds,
     }
   }
 
@@ -262,6 +391,19 @@ export class SegmentCacheManager {
   onStateChange(listener: BufferStateListener): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
+  }
+
+  // ===== 注册 FLOOD_WAIT 错误回调 =====
+  onFloodWait(callback: FloodWaitCallback): () => void {
+    this.floodWaitCallback = callback
+    return () => { this.floodWaitCallback = null }
+  }
+
+  // ===== 清除 FLOOD_WAIT 状态（用户等待后重试）=====
+  clearFloodWait(): void {
+    this.hasFloodWait = false
+    this.floodWaitSeconds = 0
+    this.emitState()
   }
 
   private emitState(): void {
@@ -358,5 +500,6 @@ export class SegmentCacheManager {
     this.segments.clear()
     this.prefetchQueue.clear()
     this.listeners.clear()
+    this.floodWaitCallback = null
   }
 }
