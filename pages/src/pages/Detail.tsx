@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip, Modal, Segmented, Alert } from 'antd'
-import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined, WifiOutlined } from '@ant-design/icons'
+import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined, WifiOutlined, PauseCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import { getMediaDetail, getEpisodes, type MediaItem, type EpisodeItem } from '../api'
 import { formatSize } from '../utils'
 import { useTheme } from '../theme'
@@ -9,6 +9,7 @@ import Artplayer from 'artplayer'
 import { useBufferedPlayer, type BufferState } from '../hooks/useBufferedPlayer'
 import type { FloodWaitInfo, SegmentFetcher } from '../hooks/SegmentCache'
 import { useBrowserTGClient } from '../hooks/useBrowserTGClient'
+import { useFrontendDownload } from '../hooks/useFrontendDownload'
 
 const { Title, Paragraph, Text } = Typography
 
@@ -83,6 +84,56 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
     fileSize,
   })
 
+  useEffect(() => {
+    if (!playerState.useMediaSource || !containerRef.current || !cacheManager.current) return
+    if (!MediaSource.isTypeSupported(mimeType || 'video/mp4')) return
+
+    const video = document.createElement('video')
+    video.controls = true
+    video.autoplay = true
+    video.style.width = '100%'
+    video.style.height = '100%'
+    video.style.background = '#000'
+    containerRef.current.replaceChildren(video)
+
+    const mediaSource = new MediaSource()
+    const objectUrl = URL.createObjectURL(mediaSource)
+    video.src = objectUrl
+
+    let cancelled = false
+    let nextIndex = 0
+    let sourceBuffer: SourceBuffer | null = null
+
+    const appendNext = async () => {
+      if (cancelled || !sourceBuffer || sourceBuffer.updating) return
+      const chunk = await cacheManager.current?.getSegment(nextIndex)
+      if (cancelled || !sourceBuffer || !chunk) return
+      sourceBuffer.appendBuffer(chunk)
+      updatePlaybackPosition(nextIndex * 1024 * 1024)
+      nextIndex += 1
+    }
+
+    const onSourceOpen = () => {
+      if (cancelled) return
+      sourceBuffer = mediaSource.addSourceBuffer(mimeType || 'video/mp4')
+      sourceBuffer.mode = 'sequence'
+      sourceBuffer.addEventListener('updateend', appendNext)
+      appendNext()
+    }
+
+    mediaSource.addEventListener('sourceopen', onSourceOpen)
+
+    return () => {
+      cancelled = true
+      sourceBuffer?.removeEventListener('updateend', appendNext)
+      mediaSource.removeEventListener('sourceopen', onSourceOpen)
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(objectUrl)
+    }
+  }, [playerState.useMediaSource, mimeType, cacheManager.current, updatePlaybackPosition])
+
   // 注册 FLOOD_WAIT 回调
   useEffect(() => {
     if (!cacheManager.current) return
@@ -94,7 +145,7 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
 
   useEffect(() => {
     if (!containerRef.current) return
-    if (playerState.initializing) return
+    if (playerState.initializing || playerState.useMediaSource) return
 
     // 确定播放 URL
     let playUrl: string
@@ -343,7 +394,19 @@ export default function Detail() {
   const [floodWait, setFloodWait] = useState<FloodWaitInfo | null>(null)
   const [playMode, setPlayMode] = useState<'proxy' | 'browser'>('proxy')
 
-  const browserClient = useBrowserTGClient(playMode === 'browser' && playing && item ? item.source_id : null)
+  const [dlRequested, setDlRequested] = useState(false)
+  const { status: dlStatus, download, pause: pauseDl, resume: resumeDl, cancel: cancelDl, reset: dlReset } = useFrontendDownload()
+
+  const browserClient = useBrowserTGClient(
+    ((playMode === 'browser' && playing) || dlRequested) && item ? item.source_id : null
+  )
+
+  useEffect(() => {
+    if (!dlRequested || !browserClient.ready || !item) return
+    if (dlStatus.state === 'idle') {
+      download(browserClient.makeFetcher(item.message_id), item.file_size, item.file_name)
+    }
+  }, [dlRequested, browserClient.ready])
   const fetcher = useMemo(
     () => playMode === 'browser' && browserClient.ready && item ? browserClient.makeFetcher(item.message_id) : undefined,
     [playMode, browserClient.ready, browserClient.makeFetcher, item?.id],
@@ -506,6 +569,14 @@ export default function Detail() {
                   >
                     代理下载
                   </Button>
+                  <Button
+                    size="large"
+                    icon={dlRequested && browserClient.loading ? <LoadingOutlined /> : <DownloadOutlined />}
+                    disabled={dlStatus.state === 'downloading' || dlStatus.state === 'paused'}
+                    onClick={() => setDlRequested(true)}
+                  >
+                    前端下载
+                  </Button>
                   {!!(item.has_direct && item.direct_url && item.file_size <= 20 * 1024 * 1024) && (
                     <Button
                       size="large"
@@ -532,6 +603,39 @@ export default function Detail() {
                     复制链接
                   </Button>
                 </Space>
+                {dlRequested && (
+                  <div style={{ marginTop: 12 }}>
+                    {browserClient.loading && <div style={{ color: '#1890ff', fontSize: 13 }}><LoadingOutlined /> 正在连接 Telegram...</div>}
+                    {browserClient.error && <div style={{ color: '#ff4d4f', fontSize: 13 }}>连接失败: {browserClient.error}</div>}
+                    {(dlStatus.state === 'downloading' || dlStatus.state === 'paused') && (
+                      <div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: isDark ? '#999' : '#666', marginBottom: 4 }}>
+                          <span>{dlStatus.state === 'paused' ? '已暂停' : '下载中...'}</span>
+                          <span>{Math.round(dlStatus.progress * 100)}%</span>
+                        </div>
+                        <Progress percent={Math.round(dlStatus.progress * 100)} size="small" showInfo={false} style={{ marginBottom: 8 }} />
+                        <Space size="small">
+                          {dlStatus.state === 'downloading'
+                            ? <Button size="small" icon={<PauseCircleOutlined />} onClick={pauseDl}>暂停</Button>
+                            : <Button size="small" type="primary" onClick={resumeDl}>继续</Button>}
+                          <Button size="small" danger icon={<CloseCircleOutlined />} onClick={() => { cancelDl(); setDlRequested(false) }}>取消</Button>
+                        </Space>
+                      </div>
+                    )}
+                    {dlStatus.state === 'done' && (
+                      <Space size="small">
+                        <span style={{ color: '#52c41a', fontSize: 13 }}>✓ 下载完成</span>
+                        <Button size="small" type="link" onClick={() => { setDlRequested(false); dlReset() }}>关闭</Button>
+                      </Space>
+                    )}
+                    {dlStatus.state === 'error' && (
+                      <Space size="small">
+                        <span style={{ color: '#ff4d4f', fontSize: 13 }}>下载失败: {dlStatus.error}</span>
+                        <Button size="small" type="link" onClick={() => { setDlRequested(false); dlReset() }}>关闭</Button>
+                      </Space>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </div>

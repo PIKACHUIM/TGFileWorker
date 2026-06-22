@@ -44,8 +44,10 @@ export function generateVirtualPlaylist(
   fileSize: number,
   mimeType: string,
   segmentDuration: number = 4,
+  segmentBaseUrl?: string,
 ): string {
   const totalSegments = Math.ceil(fileSize / VIRTUAL_SEGMENT_SIZE)
+  const base = segmentBaseUrl ? segmentBaseUrl.replace(/\/$/, '') + '/' : ''
   const lines: string[] = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -55,7 +57,7 @@ export function generateVirtualPlaylist(
 
   for (let i = 0; i < totalSegments; i++) {
     lines.push(`#EXTINF:${segmentDuration},`)
-    lines.push(`segment_${i}.ts`)
+    lines.push(`${base}segment_${i}.ts`)
   }
 
   lines.push('#EXT-X-ENDLIST')
@@ -268,12 +270,13 @@ export class HlsRangeLoader {
       const response = await fetch(url)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-      const data = await response.arrayBuffer()
+      const isText = this.context.responseType === 'text' || url.startsWith('blob:')
+      const data = isText ? await response.text() : await response.arrayBuffer()
 
       this.stats.loading.first = performance.now()
       this.stats.loading.end = performance.now()
-      this.stats.loaded = data.byteLength
-      this.stats.total = data.byteLength
+      this.stats.loaded = typeof data === 'string' ? data.length : data.byteLength
+      this.stats.total = this.stats.loaded
 
       this.callbacks.onSuccess(
         { url, data },

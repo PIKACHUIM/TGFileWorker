@@ -47,6 +47,8 @@ export interface BufferedPlayerState {
   fallback: boolean
   /** 下载进度 (0~1)，仅非 HLS 流 */
   downloadProgress: number
+  /** 是否使用 MediaSource 追加浏览器直连数据 */
+  useMediaSource: boolean
 }
 
 export function useBufferedPlayer(options: BufferedPlayerOptions) {
@@ -63,6 +65,7 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
     hlsConfig: null,
     fallback: false,
     downloadProgress: 0,
+    useMediaSource: false,
   })
 
   const isHls = mimeType === 'application/x-mpegURL' || src.endsWith('.m3u8')
@@ -109,11 +112,26 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
           return
         }
 
-        // 非 HLS 流：判断文件大小（有自定义 fetcher 时跳过 fallback，避免回退到后端 URL）
+        // 非 HLS 流：判断文件大小
         const totalBytes = bufferState.totalBytes
 
-        if (!fetcher && totalBytes > maxPreloadSize) {
-          // 超大文件：回退到直接播放，但仍利用缓存管理器预加载头部
+        if (fetcher) {
+          // 浏览器直连模式：初始缓冲完成后立即交给 MediaSource 追加缓存数据，避免等待全量下载
+          if (!cancelled) {
+            setState(prev => ({
+              ...prev,
+              initializing: false,
+              ready: true,
+              useMediaSource: true,
+              bufferState: cache.getState(),
+            }))
+          }
+          cache.startPrefetch()
+          return
+        }
+
+        if (totalBytes > maxPreloadSize) {
+          // 超大文件：回退到直接播放
           if (!cancelled) {
             setState(prev => ({
               ...prev,

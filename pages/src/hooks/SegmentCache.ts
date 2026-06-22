@@ -130,6 +130,11 @@ export class SegmentCacheManager {
     return this.initPromise
   }
 
+  // ===== 对外暴露：启动后台预加载 =====
+  startPrefetch(): void {
+    this.startPrefetchTask()
+  }
+
   // ===== 主动预加载任务（3并发）=====
   private async startPrefetchTask(): Promise<void> {
     if (this.prefetchTaskRunning || this.destroyed) return
