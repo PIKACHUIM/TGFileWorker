@@ -155,7 +155,7 @@ app.get('/stream/:id', async (c) => {
       } catch (e) {
         console.error('[stream] MTProto error:', e)
       } finally {
-        await client.disconnect().catch(() => {})
+        await client.destroy().catch(() => {})
         writer.close()
       }
     })()

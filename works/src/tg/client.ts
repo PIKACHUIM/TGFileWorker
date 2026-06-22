@@ -35,54 +35,35 @@ export async function getTGClient(env: Env, source: Source): Promise<TelegramCli
   if (!source.api_id || !source.api_hash) {
     throw new Error('该来源未配置 api_id / api_hash')
   }
+  return _connect(env, source)
+}
 
+async function _connect(env: Env, source: Source): Promise<TelegramClient> {
   const sessionKey = `session:${source.id}`
   const sessionStr = source.session_string || (await env.KV.get(sessionKey)) || undefined
 
+  try { await patchEarlyTimer() } catch {}
+
+  const storage = new KVStorage(env.KV, source.id)
+  // No preload: stale DC keys from a previous session cause AUTH_BYTES_INVALID
+  // when the new client tries to export auth to a different DC. Fresh auth per request.
+
+  const client = new TelegramClient({
+    apiId: Number(source.api_id),
+    apiHash: source.api_hash!,
+    storage,
+    crypto: new WebCryptoProvider({ wasmInput: getMtcuteWasmModule() }),
+    transport: new DOProxyTransport(env),
+    disableUpdates: true,
+  })
+
   try {
-    await patchEarlyTimer()
+    await client.start({ session: sessionStr })
+    const exported = await client.exportSession()
+    if (exported) await env.KV.put(sessionKey, exported as string)
+    return client
   } catch (e) {
-    console.warn('[getTGClient] patchEarlyTimer failed (non-fatal):', e)
+    await client.destroy().catch(() => {})
+    throw e
   }
-
-  let client: TelegramClient | null = null
-  let storage: KVStorage | null = null
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    storage = new KVStorage(env.KV, source.id)
-    if (attempt === 0) {
-      await storage.preload()
-    }
-
-    const wasmModule = getMtcuteWasmModule()
-    const doProxyTransport = new DOProxyTransport(env)
-
-    client = new TelegramClient({
-      apiId: Number(source.api_id),
-      apiHash: source.api_hash,
-      storage,
-      crypto: new WebCryptoProvider({ wasmInput: wasmModule }),
-      transport: doProxyTransport,
-      disableUpdates: true,
-      connectionCount: (kind) => kind === 'main' ? 1 : 0,
-    })
-
-    try {
-      await client.start({ session: sessionStr })
-      const exported = await client.exportSession()
-      if (exported) await env.KV.put(sessionKey, exported as string)
-      return client
-    } catch (e: any) {
-      if (attempt === 0 && e?.message?.includes('AUTH_BYTES_INVALID')) {
-        console.warn('[getTGClient] AUTH_BYTES_INVALID: clearing and retrying')
-        await storage.deleteAllAuthKeys()
-        await client.destroy().catch(() => {})
-        client = null
-        continue
-      }
-      throw e
-    }
-  }
-
-  throw new Error('getTGClient: unreachable')
 }

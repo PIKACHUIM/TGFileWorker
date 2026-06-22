@@ -9,9 +9,9 @@
 import { SegmentCacheManager } from './SegmentCache'
 
 // ===== 片段大小（与 SegmentCacheManager 保持一致） =====
-const SEGMENT_SIZE = 512 * 1024  // 512KB
+const SEGMENT_SIZE = 1024 * 1024     // 每个片段 1MB
 // ===== 每个虚拟 HLS 片段包含的分片数 =====
-const CHUNKS_PER_SEGMENT = 4     // 每个虚拟片段 2MB (512KB * 4)
+const CHUNKS_PER_SEGMENT = 2          // 每个虚拟片段 2MB (1MB * 2)
 // ===== 虚拟片段大小 =====
 const VIRTUAL_SEGMENT_SIZE = SEGMENT_SIZE * CHUNKS_PER_SEGMENT // 2MB
 

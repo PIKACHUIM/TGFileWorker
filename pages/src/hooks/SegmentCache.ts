@@ -77,10 +77,7 @@ export class SegmentCacheManager {
   private hasFloodWait = false
   private floodWaitSeconds = 0
   
-  // ===== 主动预加载相关 =====
-  private prefetchTarget = 0          // 目标预加载位置
-  private isPrefetching = false       // 是否正在主动预加载
-  private prefetchTaskRunning = false  // 预加载任务是否正在运行
+  private prefetchTaskRunning = false
 
   constructor(url: string) {
     this.url = url
@@ -122,45 +119,27 @@ export class SegmentCacheManager {
     return this.initPromise
   }
 
-  // ===== 主动预加载任务 =====
-  // 持续预加载直到达到目标位置或文件末尾
+  // ===== 主动预加载任务（3并发）=====
   private async startPrefetchTask(): Promise<void> {
     if (this.prefetchTaskRunning || this.destroyed) return
     this.prefetchTaskRunning = true
-    this.isPrefetching = true
 
-    while (!this.destroyed) {
-      // 计算需要预加载的片段
-      const nextIndex = this.findNextPrefetchIndex()
-      if (nextIndex === -1) {
-        // 没有需要预加载的片段了
-        break
-      }
+    await Promise.allSettled(Array.from({ length: 3 }, () => this._prefetchWorker()))
 
-      // 检查是否超过最大缓存限制
-      const cachedAhead = this.countConsecutiveAhead()
-      if (cachedAhead >= MAX_BUFFER_SEGMENTS) {
-        // 已达到最大缓存，等待播放进度前进
-        break
-      }
-
-      // 加载这个片段
-      this.prefetchingCount++
-      this.prefetchQueue.add(nextIndex)
-      this.emitState()
-
-      try {
-        await this.fetchSegment(nextIndex)
-      } catch {
-        // 单个片段加载失败不中断整体预加载
-      }
-
-      // 继续循环加载下一个
-    }
-
-    this.isPrefetching = false
     this.prefetchTaskRunning = false
     this.emitState()
+  }
+
+  private async _prefetchWorker(): Promise<void> {
+    while (!this.destroyed) {
+      if (this.countConsecutiveAhead() >= MAX_BUFFER_SEGMENTS) break
+      const nextIndex = this.findNextPrefetchIndex()
+      if (nextIndex === -1) break
+      this.prefetchQueue.add(nextIndex)
+      this.prefetchingCount++
+      this.emitState()
+      try { await this.fetchSegment(nextIndex) } catch {}
+    }
   }
 
   // ===== 找到下一个需要预加载的片段索引 =====
@@ -272,24 +251,6 @@ export class SegmentCacheManager {
       this.prefetchQueue.delete(index)
       this.prefetchingCount = Math.max(0, this.prefetchingCount - 1)
       this.emitState()
-
-      // 如果当前预加载任务正在运行，继续预加载下一个
-      if (this.prefetchTaskRunning && !this.destroyed) {
-        // 异步继续预加载，不阻塞当前任务
-        setTimeout(() => this.continuePrefetchIfNeeded(), 0)
-      }
-    }
-  }
-
-  // ===== 继续预加载（如果需要）=====
-  private continuePrefetchIfNeeded(): void {
-    if (this.destroyed || this.prefetchTaskRunning) return
-
-    const consecutiveAhead = this.countConsecutiveAhead()
-    
-    // 如果前方缓存不足，继续预加载
-    if (consecutiveAhead < PREFETCH_TRIGGER_THRESHOLD && consecutiveAhead < MAX_BUFFER_SEGMENTS) {
-      this.startPrefetchTask()
     }
   }
 
