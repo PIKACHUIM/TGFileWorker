@@ -21,7 +21,9 @@ function BufferIndicator({ bufferState, isDark, downloadProgress, fallback }: {
   if (!bufferState) return null
 
   const { isBuffering, bufferProgress, cachedSegments, totalSegments, prefetching, cachedBytes, totalBytes } = bufferState
-  const percent = Math.round(bufferProgress * 100)
+  const percent = fallback && totalBytes > 0
+    ? Math.round(cachedBytes / totalBytes * 100)
+    : Math.round(bufferProgress * 100)
   const dlPercent = downloadProgress !== undefined ? Math.round(downloadProgress * 100) : null
 
   return (
@@ -110,6 +112,24 @@ function VideoPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: s
       pip: true,
       fullscreen: true,
       setting: true,
+      settings: [
+        {
+          html: '速度',
+          tooltip: '1x',
+          selector: [
+            { html: '0.5x', value: 0.5 },
+            { html: '0.75x', value: 0.75 },
+            { html: '1x', value: 1, default: true },
+            { html: '1.25x', value: 1.25 },
+            { html: '1.5x', value: 1.5 },
+            { html: '2x', value: 2 },
+          ],
+          onSelect(item: any) {
+            (this as any).art.playbackRate = item.value
+            return item.html
+          },
+        },
+      ],
     }
 
     // HLS 流需要使用 HLS.js
@@ -232,6 +252,24 @@ function DirectVideoPlayer({ src }: { src: string }) {
       pip: true,
       fullscreen: true,
       setting: true,
+      settings: [
+        {
+          html: '速度',
+          tooltip: '1x',
+          selector: [
+            { html: '0.5x', value: 0.5 },
+            { html: '0.75x', value: 0.75 },
+            { html: '1x', value: 1, default: true },
+            { html: '1.25x', value: 1.25 },
+            { html: '1.5x', value: 1.5 },
+            { html: '2x', value: 2 },
+          ],
+          onSelect(item: any) {
+            (this as any).art.playbackRate = item.value
+            return item.html
+          },
+        },
+      ],
     }
     artRef.current = new Artplayer(artOptions)
     return () => {
