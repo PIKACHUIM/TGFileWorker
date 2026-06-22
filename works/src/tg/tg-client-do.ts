@@ -21,6 +21,19 @@ export class TGClientDO {
   private _initPromise: Promise<TelegramClient> | null = null
   private _fileCache = new Map<number, FileInfo>()
 
+  // Flood wait tracking: return 429 on next request if still waiting
+  private _floodWaitUntil = 0
+
+  private _remainingFloodWait(): number {
+    return Math.max(0, Math.ceil((this._floodWaitUntil - Date.now()) / 1000))
+  }
+
+  private _recordFloodWait(e: any): void {
+    if (e?.code !== 420) return
+    const seconds: number = e.seconds || parseInt(String(e?.text || '').match(/_(\d+)$/)?.[1] ?? '0') || 0
+    if (seconds > 0) this._floodWaitUntil = Date.now() + seconds * 1000
+  }
+
   // Semaphore: max 2 concurrent upload.getFile loops to avoid flood wait
   private _slots = 2
   private _waitQueue: Array<() => void> = []
@@ -99,6 +112,15 @@ export class TGClientDO {
   async fetch(req: Request): Promise<Response> {
     const { source, messageId, channelId, start, end }: StreamRequest = await req.json()
 
+    // Return 429 immediately if still in flood wait period
+    const fw = this._remainingFloodWait()
+    if (fw > 0) {
+      return Response.json(
+        { error: 'FLOOD_WAIT', waitSeconds: fw, message: `Telegram API 限流，请等待 ${fw} 秒后重试` },
+        { status: 429, headers: { 'Retry-After': String(fw) } },
+      )
+    }
+
     let client: TelegramClient
     try {
       client = await this._ensureClient(source)
@@ -145,6 +167,7 @@ export class TGClientDO {
           if ((result as any).bytes.length < CHUNK) break
         }
       } catch (e) {
+        this._recordFloodWait(e)
         this._resetClient(client)
         console.error('[TGClientDO] stream error:', e)
       } finally {

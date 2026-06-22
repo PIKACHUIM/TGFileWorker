@@ -92,7 +92,7 @@ app.get('/stream/:id', async (c) => {
   }))
   if (!doResp.ok) {
     const err = await doResp.json() as any
-    return c.json({ error: err.error }, doResp.status as any)
+    return c.json(err, doResp.status as any)
   }
   return new Response(doResp.body, {
     status,

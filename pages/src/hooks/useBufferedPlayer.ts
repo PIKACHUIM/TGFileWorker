@@ -14,20 +14,19 @@
  *    - 对于超大文件（>500MB），回退到直接播放模式
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { SegmentCacheManager, type BufferState } from './SegmentCache'
+import { SegmentCacheManager, type BufferState, type SegmentFetcher } from './SegmentCache'
 
 export { type BufferState }
 
 // ===== 播放器配置选项 =====
 export interface BufferedPlayerOptions {
-  /** 视频流 URL */
   src: string
-  /** MIME 类型 */
   mimeType?: string
-  /** 是否为音频 */
   isAudio?: boolean
-  /** 最大允许预加载到内存的文件大小（默认 500MB） */
   maxPreloadSize?: number
+  fetcher?: SegmentFetcher
+  /** 已知文件大小（浏览器直连模式跳过 HEAD 请求） */
+  fileSize?: number
 }
 
 // ===== 缓存播放器状态 =====
@@ -51,7 +50,7 @@ export interface BufferedPlayerState {
 }
 
 export function useBufferedPlayer(options: BufferedPlayerOptions) {
-  const { src, mimeType, isAudio, maxPreloadSize = 500 * 1024 * 1024 } = options
+  const { src, mimeType, isAudio, maxPreloadSize = 500 * 1024 * 1024, fetcher, fileSize } = options
 
   const cacheRef = useRef<SegmentCacheManager | null>(null)
   const blobUrlRef = useRef<string | null>(null)
@@ -72,7 +71,7 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
   useEffect(() => {
     if (!src) return
 
-    const cache = new SegmentCacheManager(src)
+    const cache = new SegmentCacheManager(src, fetcher, fileSize)
     cacheRef.current = cache
 
     let cancelled = false
@@ -110,10 +109,10 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
           return
         }
 
-        // 非 HLS 流：判断文件大小
-        const fileSize = bufferState.totalBytes
+        // 非 HLS 流：判断文件大小（有自定义 fetcher 时跳过 fallback，避免回退到后端 URL）
+        const totalBytes = bufferState.totalBytes
 
-        if (fileSize > maxPreloadSize) {
+        if (!fetcher && totalBytes > maxPreloadSize) {
           // 超大文件：回退到直接播放，但仍利用缓存管理器预加载头部
           if (!cancelled) {
             setState(prev => ({
@@ -127,27 +126,25 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
           return
         }
 
-        // 中小文件：并行预加载全部数据到 Blob 后播放
-        await cache.downloadAll((loaded, total) => {
+        // 下载全部数据到内存，完成后创建 Blob URL
+        await cache.downloadAll((_, __) => {
           if (!cancelled) {
             const currentState = cache.getState()
-            const progress = currentState.cachedBytes / fileSize
             setState(prev => ({
               ...prev,
               bufferState: currentState,
-              downloadProgress: progress,
+              downloadProgress: currentState.cachedBytes / totalBytes,
             }))
           }
         })
         if (cancelled) return
 
-        // 全部下载完成，创建 Blob URL
+        // 全部下载完成，创建/更新 Blob URL
         const finalBlob = createBlobFromCache(cache, mimeType)
         if (finalBlob && !cancelled) {
           const finalUrl = URL.createObjectURL(finalBlob)
           if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
           blobUrlRef.current = finalUrl
-
           setState(prev => ({
             ...prev,
             initializing: false,
@@ -190,7 +187,7 @@ export function useBufferedPlayer(options: BufferedPlayerOptions) {
         blobUrlRef.current = null
       }
     }
-  }, [src, mimeType, isAudio, maxPreloadSize])
+  }, [src, mimeType, isAudio, maxPreloadSize, fetcher, fileSize])
 
   // ===== 播放位置更新（通知缓存管理器） =====
   const updatePlaybackPosition = useCallback((byteOffset: number) => {

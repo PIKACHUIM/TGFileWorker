@@ -88,6 +88,19 @@ export default function Settings() {
 
           <Divider />
 
+          <Typography.Text strong>浏览器直连（⚠️ 牺牲安全性）</Typography.Text>
+          <Form.Item
+            label="允许浏览器直连 MTProto"
+            name="allow_direct_mtproto"
+            valuePropName="checked"
+            extra="开启后，已登录用户可获取 API 凭据在浏览器内直接连接 Telegram，绕过代理限速。会将 api_hash 和 session 暴露给前端，存在安全风险。"
+            style={{ marginTop: 12 }}
+          >
+            <Switch />
+          </Form.Item>
+
+          <Divider />
+
           <Typography.Text strong>其他</Typography.Text>
           <Form.Item label="Worker 公开 URL" name="worker_url" extra="用于生成 STRM 文件内容，例如 https://xxx.workers.dev" style={{ marginTop: 12 }}>
             <Input />

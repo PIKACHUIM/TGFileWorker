@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip, Modal } from 'antd'
-import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined } from '@ant-design/icons'
+import { Button, Descriptions, Rate, Space, Tag, Typography, Breadcrumb, Spin, message, Switch, Layout, Progress, Tooltip, Modal, Segmented, Alert } from 'antd'
+import { DownloadOutlined, PlayCircleOutlined, FileOutlined, LinkOutlined, MoonOutlined, SunOutlined, UnorderedListOutlined, CloudOutlined, LoadingOutlined, WifiOutlined } from '@ant-design/icons'
 import { getMediaDetail, getEpisodes, type MediaItem, type EpisodeItem } from '../api'
 import { formatSize } from '../utils'
 import { useTheme } from '../theme'
 import Artplayer from 'artplayer'
 import { useBufferedPlayer, type BufferState } from '../hooks/useBufferedPlayer'
-import type { FloodWaitInfo } from '../hooks/SegmentCache'
+import type { FloodWaitInfo, SegmentFetcher } from '../hooks/SegmentCache'
+import { useBrowserTGClient } from '../hooks/useBrowserTGClient'
 
 const { Title, Paragraph, Text } = Typography
 
@@ -66,7 +67,7 @@ function BufferIndicator({ bufferState, isDark, downloadProgress, fallback }: {
 }
 
 // ===== 带缓存队列的视频播放器 =====
-function VideoPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void }) {
+function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void; fetcher?: SegmentFetcher; fileSize?: number }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const artRef = useRef<Artplayer | null>(null)
   const hlsRef = useRef<any>(null)
@@ -78,6 +79,8 @@ function VideoPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: s
     src,
     mimeType,
     isAudio: false,
+    fetcher,
+    fileSize,
   })
 
   // 注册 FLOOD_WAIT 回调
@@ -125,7 +128,7 @@ function VideoPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: s
             { html: '2x', value: 2 },
           ],
           onSelect(item: any) {
-            (this as any).art.playbackRate = item.value
+            artRef.current!.playbackRate = item.value
             return item.html
           },
         },
@@ -265,7 +268,7 @@ function DirectVideoPlayer({ src }: { src: string }) {
             { html: '2x', value: 2 },
           ],
           onSelect(item: any) {
-            (this as any).art.playbackRate = item.value
+            artRef.current!.playbackRate = item.value
             return item.html
           },
         },
@@ -284,7 +287,7 @@ function DirectVideoPlayer({ src }: { src: string }) {
 }
 
 // ===== 带缓存队列的音频播放器 =====
-function AudioPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void }) {
+function AudioPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: string; mimeType?: string; onFloodWait?: (info: FloodWaitInfo) => void; fetcher?: SegmentFetcher; fileSize?: number }) {
   const { isDark } = useTheme()
   const audioRef = useRef<HTMLAudioElement>(null)
 
@@ -293,6 +296,8 @@ function AudioPlayer({ src, mimeType, onFloodWait }: { src: string; mimeType?: s
     src,
     mimeType,
     isAudio: true,
+    fetcher,
+    fileSize,
   })
 
   // 注册 FLOOD_WAIT 回调
@@ -336,6 +341,13 @@ export default function Detail() {
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
   const [floodWait, setFloodWait] = useState<FloodWaitInfo | null>(null)
+  const [playMode, setPlayMode] = useState<'proxy' | 'browser'>('proxy')
+
+  const browserClient = useBrowserTGClient(playMode === 'browser' && playing && item ? item.source_id : null)
+  const fetcher = useMemo(
+    () => playMode === 'browser' && browserClient.ready && item ? browserClient.makeFetcher(item.message_id) : undefined,
+    [playMode, browserClient.ready, browserClient.makeFetcher, item?.id],
+  )
 
   const loadDetail = (mediaId: number) => {
     setLoading(true)
@@ -404,12 +416,28 @@ export default function Detail() {
           {/* 播放器 - 单独区域，下方留出间距 */}
           {playing && isVideo && (
             <div style={{ marginBottom: 32 }}>
-              <VideoPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} />
+              {playMode === 'browser' && browserClient.loading && (
+                <div style={{ textAlign: 'center', padding: 16, color: '#1890ff' }}><LoadingOutlined /> 正在连接 Telegram...</div>
+              )}
+              {playMode === 'browser' && browserClient.error && (
+                <Alert type="error" message={`浏览器直连失败: ${browserClient.error}`} style={{ marginBottom: 8 }} />
+              )}
+              {(playMode === 'proxy' || browserClient.ready) && (
+                <VideoPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} fetcher={fetcher} fileSize={item.file_size || undefined} />
+              )}
             </div>
           )}
           {playing && isAudio && (
             <div style={{ marginBottom: 32 }}>
-              <AudioPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} />
+              {playMode === 'browser' && browserClient.loading && (
+                <div style={{ textAlign: 'center', padding: 16, color: '#1890ff' }}><LoadingOutlined /> 正在连接 Telegram...</div>
+              )}
+              {playMode === 'browser' && browserClient.error && (
+                <Alert type="error" message={`浏览器直连失败: ${browserClient.error}`} style={{ marginBottom: 8 }} />
+              )}
+              {(playMode === 'proxy' || browserClient.ready) && (
+                <AudioPlayer src={item.stream_url || `/api/stream/${item.id}`} mimeType={item.mime_type} onFloodWait={handleFloodWait} fetcher={fetcher} fileSize={item.file_size || undefined} />
+              )}
             </div>
           )}
 
@@ -449,6 +477,19 @@ export default function Detail() {
 
               {/* 播放按钮组 - 与信息区域保持间距 */}
               <div style={{ marginTop: 28, paddingTop: 20, borderTop: `1px solid ${borderColor}` }}>
+                {canPlay && (
+                  <div style={{ marginBottom: 12 }}>
+                    <Segmented
+                      size="small"
+                      value={playMode}
+                      onChange={v => { setPlayMode(v as 'proxy' | 'browser'); setPlaying(false) }}
+                      options={[
+                        { label: '代理播放', value: 'proxy' },
+                        { label: <><WifiOutlined /> 浏览器直连</>, value: 'browser' },
+                      ]}
+                    />
+                  </div>
+                )}
                 <Space wrap size="middle">
                   {canPlay && !playing && (
                     <Button type="primary" size="large" icon={<PlayCircleOutlined />} onClick={() => setPlaying(true)}>
@@ -465,7 +506,7 @@ export default function Detail() {
                   >
                     代理下载
                   </Button>
-                  {item.has_direct && item.direct_url && (
+                  {!!(item.has_direct && item.direct_url && item.file_size <= 20 * 1024 * 1024) && (
                     <Button
                       size="large"
                       icon={<LinkOutlined />}

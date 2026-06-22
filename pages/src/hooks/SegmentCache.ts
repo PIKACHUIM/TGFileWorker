@@ -60,6 +60,8 @@ export interface BufferState {
 
 type BufferStateListener = (state: BufferState) => void
 
+export type SegmentFetcher = (start: number, end: number) => Promise<ArrayBuffer>
+
 export class SegmentCacheManager {
   private segments: Map<number, CacheSegment> = new Map()
   private fileSize = 0
@@ -76,35 +78,44 @@ export class SegmentCacheManager {
   private floodWaitCallback: FloodWaitCallback | null = null
   private hasFloodWait = false
   private floodWaitSeconds = 0
-  
+  private customFetcher?: SegmentFetcher
+
   private prefetchTaskRunning = false
 
-  constructor(url: string) {
+  constructor(url: string, fetcher?: SegmentFetcher, knownFileSize?: number) {
     this.url = url
+    this.customFetcher = fetcher
+    if (knownFileSize) {
+      this.fileSize = knownFileSize
+      this.totalSegments = Math.ceil(knownFileSize / SEGMENT_SIZE)
+      // 不设 initResolved，让 init() 仍然执行预加载初始片段
+    }
   }
 
-  // ===== 初始化：发 HEAD 请求获取文件大小 =====
+  // ===== 初始化：发 HEAD 请求获取文件大小（已知大小时跳过）=====
   async init(): Promise<void> {
     if (this.initResolved) return
     if (this.initPromise) return this.initPromise
 
     this.initPromise = (async () => {
       try {
-        const resp = await fetch(this.url, { method: 'HEAD' })
-        const contentLength = resp.headers.get('Content-Length')
-        if (!contentLength) {
-          // HEAD 不返回 Content-Length 时，尝试 Range 0-0
-          const rangeResp = await fetch(this.url, { headers: { Range: 'bytes=0-0' } })
-          const rangeHeader = rangeResp.headers.get('Content-Range')
-          if (rangeHeader) {
-            const match = rangeHeader.match(/\/(\d+)/)
-            if (match) this.fileSize = parseInt(match[1])
+        if (!this.fileSize) {
+          // 未知文件大小：发 HEAD 请求
+          const resp = await fetch(this.url, { method: 'HEAD' })
+          const contentLength = resp.headers.get('Content-Length')
+          if (!contentLength) {
+            const rangeResp = await fetch(this.url, { headers: { Range: 'bytes=0-0' } })
+            const rangeHeader = rangeResp.headers.get('Content-Range')
+            if (rangeHeader) {
+              const match = rangeHeader.match(/\/(\d+)/)
+              if (match) this.fileSize = parseInt(match[1])
+            }
+          } else {
+            this.fileSize = parseInt(contentLength)
           }
-        } else {
-          this.fileSize = parseInt(contentLength)
+          this.totalSegments = Math.ceil(this.fileSize / SEGMENT_SIZE)
         }
 
-        this.totalSegments = Math.ceil(this.fileSize / SEGMENT_SIZE)
         this.initResolved = true
         this.emitState()
 
@@ -203,6 +214,15 @@ export class SegmentCacheManager {
     this.abortController = controller
 
     try {
+      // 浏览器直连模式：使用自定义 fetcher（TG client）代替 HTTP Range 请求
+      if (this.customFetcher) {
+        const data = await this.customFetcher(start, end)
+        if (!this.destroyed) {
+          this.segments.set(index, { index, start, end, data, timestamp: Date.now() })
+        }
+        return
+      }
+
       const headers: Record<string, string> = { Range: `bytes=${start}-${end}` }
       // 如果 URL 已带 hash 参数则不需要额外认证头
       if (!this.url.includes('hash=')) {
@@ -336,7 +356,7 @@ export class SegmentCacheManager {
       cachedSegments,
       prefetching: this.prefetchingCount,
       bufferProgress: this.totalSegments > 0
-        ? consecutiveAhead / Math.min(this.totalSegments, MAX_BUFFER_SEGMENTS) : 0,
+        ? Math.min(1, consecutiveAhead / Math.min(this.totalSegments, MAX_BUFFER_SEGMENTS)) : 0,
       isBuffering: consecutiveAhead < MIN_BUFFER_SEGMENTS && this.totalSegments > 0,
       currentSegmentIndex: this.currentSegmentIndex,
       totalSegments: this.totalSegments,
@@ -426,16 +446,19 @@ export class SegmentCacheManager {
         if (start >= this.fileSize) continue
 
         try {
-          const headers: Record<string, string> = { Range: `bytes=${start}-${end}` }
-          if (!this.url.includes('hash=')) {
-            const token = localStorage.getItem('token')
-            if (token) headers['Authorization'] = `Bearer ${token}`
+          let data: ArrayBuffer
+          if (this.customFetcher) {
+            data = await this.customFetcher(start, end)
+          } else {
+            const headers: Record<string, string> = { Range: `bytes=${start}-${end}` }
+            if (!this.url.includes('hash=')) {
+              const token = localStorage.getItem('token')
+              if (token) headers['Authorization'] = `Bearer ${token}`
+            }
+            const resp = await fetch(this.url, { headers })
+            if (!resp.ok && resp.status !== 206) continue
+            data = await resp.arrayBuffer()
           }
-
-          const resp = await fetch(this.url, { headers })
-          if (!resp.ok && resp.status !== 206) continue
-
-          const data = await resp.arrayBuffer()
           if (!this.destroyed) {
             this.segments.set(index, {
               index, start, end, data, timestamp: Date.now(),

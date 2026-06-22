@@ -10,6 +10,7 @@ import streamRoutes from './routes/stream'
 import settingsRoutes from './routes/settings'
 import usersRoutes from './routes/users'
 import sessionGenRoutes from './routes/session-gen'
+import tgSessionRoutes from './routes/tg-session'
 import { WebSocketProxy } from './ws-proxy'
 import { SessionGenDO } from './tg/session-gen-do'
 import { TGClientDO } from './tg/tg-client-do'
@@ -38,6 +39,7 @@ app.route('/api/admin/settings', settingsRoutes)
 app.route('/api/admin/users', usersRoutes)
 app.route('/api/media', publicRoutes)
 app.route('/api/session-gen', sessionGenRoutes)
+app.route('/api/tg-session', tgSessionRoutes)
 app.route('/api', streamRoutes)
 
 // 非API请求转发给静态资源绑定（前端SPA）
