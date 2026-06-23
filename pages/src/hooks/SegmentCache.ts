@@ -361,7 +361,7 @@ export class SegmentCacheManager {
       cachedSegments,
       prefetching: this.prefetchingCount,
       bufferProgress: this.totalSegments > 0
-        ? Math.min(1, consecutiveAhead / Math.min(this.totalSegments, MAX_BUFFER_SEGMENTS)) : 0,
+        ? Math.min(1, consecutiveAhead / Math.min(this.totalSegments, MIN_BUFFER_SEGMENTS)) : 0,
       isBuffering: consecutiveAhead < MIN_BUFFER_SEGMENTS && this.totalSegments > 0,
       currentSegmentIndex: this.currentSegmentIndex,
       totalSegments: this.totalSegments,

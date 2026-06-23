@@ -86,7 +86,9 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
 
   useEffect(() => {
     if (!playerState.useMediaSource || !containerRef.current || !cacheManager.current) return
-    if (!MediaSource.isTypeSupported(mimeType || 'video/mp4')) return
+    // Bare MIME types (e.g. 'video/mp4') fail isTypeSupported — qualify with codecs
+    const mseCodec = (mimeType && /codecs/.test(mimeType)) ? mimeType : `${mimeType || 'video/mp4'}; codecs="avc1.42E01E, mp4a.40.2"`
+    if (!MediaSource.isTypeSupported(mseCodec)) return
 
     const video = document.createElement('video')
     video.controls = true
@@ -107,7 +109,12 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
     const appendNext = async () => {
       if (cancelled || !sourceBuffer || sourceBuffer.updating) return
       const chunk = await cacheManager.current?.getSegment(nextIndex)
-      if (cancelled || !sourceBuffer || !chunk) return
+      if (cancelled || !sourceBuffer) return
+      if (!chunk) {
+        // 所有片段已追加完毕，关闭 MediaSource
+        if (mediaSource.readyState === 'open') mediaSource.endOfStream()
+        return
+      }
       sourceBuffer.appendBuffer(chunk)
       updatePlaybackPosition(nextIndex * 1024 * 1024)
       nextIndex += 1
@@ -115,7 +122,7 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
 
     const onSourceOpen = () => {
       if (cancelled) return
-      sourceBuffer = mediaSource.addSourceBuffer(mimeType || 'video/mp4')
+      sourceBuffer = mediaSource.addSourceBuffer(mseCodec)
       sourceBuffer.mode = 'sequence'
       sourceBuffer.addEventListener('updateend', appendNext)
       appendNext()
@@ -250,7 +257,9 @@ function VideoPlayer({ src, mimeType, onFloodWait, fetcher, fileSize }: { src: s
           {playerState.bufferState && (
             <div style={{ width: 200 }}>
               <Progress
-                percent={Math.round(playerState.bufferState.bufferProgress * 100)}
+                percent={playerState.bufferState.totalBytes > 0
+                  ? Math.round(playerState.bufferState.cachedBytes / playerState.bufferState.totalBytes * 100)
+                  : Math.round(playerState.bufferState.bufferProgress * 100)}
                 strokeColor="#1890ff"
                 size="small"
               />
